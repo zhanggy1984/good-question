@@ -1,0 +1,50 @@
+# ── Web 框架 ──
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+python-multipart==0.0.18
+aiofiles==24.1.0
+
+# ── 数据库 ──
+sqlalchemy==2.0.36
+alembic==1.14.0
+pymysql==1.1.1
+chromadb-client==0.5.23
+
+# ── 认证 ──
+python-jose[cryptography]==3.3.0
+bcrypt==5.0.0
+
+# ── 配置 ──
+python-dotenv==1.0.1
+pydantic-settings==2.7.0
+
+# ── 异步 HTTP ──
+httpx==0.28.1
+
+# ── 全文检索 ──
+elasticsearch==8.13.0
+
+# ═══════════════════════════════════════
+# AI/ML 依赖（镜像体积会膨胀到 8GB+，首次构建慢）
+# ═══════════════════════════════════════
+
+# ── LangChain 全家桶（1.x 版本；langchain-community 无 1.x，本项目未用到）──
+langchain-core>=1.0,<2.0
+langchain-text-splitters>=1.0,<2.0
+langchain-huggingface>=1.0,<2.0
+langchain-chroma>=1.0,<2.0
+langchain-openai>=1.0,<2.0
+
+# ── 向量 & 模型 ──
+# FastEmbed（ONNX 运行时，无 torch 依赖，避免 CUDA 大包下载）
+fastembed>=0.4,<1.0
+# transformers 用于 chunker 的 AutoTokenizer 精确 token 计数
+transformers>=4.41,<5
+# sentence-transformers 用于 rerank（CrossEncoder 加载 bge-reranker，依赖已装好的 torch）
+sentence-transformers>=3.3,<4
+
+# ── 文档抽取 ──
+# MinerU 3.x（pipeline backend 需 torch>=2.6，由 Dockerfile 单独装 CPU 版）
+mineru[pipeline]==3.4.4
+pymupdf==1.25.1                 # MinerU 降级方案：PDF
+python-docx>=1.2.0,<2           # MinerU 降级方案：DOCX（mineru 要求 >=1.2.0）

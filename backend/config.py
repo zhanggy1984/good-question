@@ -1,0 +1,75 @@
+"""核心配置，从 .env 文件读取所有环境变量"""
+from pydantic_settings import BaseSettings
+
+
+class Settings(BaseSettings):
+    # MySQL
+    mysql_root_password: str = "change_me"
+    mysql_database: str = "native_rag"
+    mysql_host: str = "mysql"
+    mysql_port: int = 3306
+
+    # ChromaDB
+    chroma_host: str = "chromadb"
+    chroma_port: int = 8000
+
+    # Elasticsearch
+    es_host: str = "elasticsearch"
+    es_port: int = 9200
+
+    @property
+    def es_url(self) -> str:
+        """构建 ES 连接地址"""
+        return f"http://{self.es_host}:{self.es_port}"
+
+    # DeepSeek LLM
+    deepseek_api_key: str = "sk-xxx"
+    deepseek_base_url: str = "https://api.deepseek.com/v1"
+    deepseek_model: str = "deepseek-v4-pro"
+
+    # Embedding
+    embedding_model_name: str = "BAAI/bge-small-zh-v1.5"
+    embedding_device: str = "cpu"
+    # FastEmbed 模型缓存目录（挂载 volume 持久化，避免容器重启丢模型）
+    fastembed_cache_dir: str = "/root/.cache/fastembed"
+
+    # Rerank
+    rerank_model_name: str = "BAAI/bge-reranker-v2-m3"
+    rerank_device: str = "cpu"
+    # 检索相似度阈值：rerank 分数低于此值的 chunk 被过滤（宁缺毋滥）
+    similarity_threshold: float = 0.80
+    # 无结果判定阈值：rerank 最高分低于此值才判定"文档无关"（返回空，不发 sources）
+    # 绝对阈值（similarity_threshold）经实测不可靠（相关 chunk 可能低分），改为相对排序 + 此低阈值兜底
+    similarity_threshold_low: float = 0.20
+
+    # Admin
+    admin_username: str = "admin"
+    admin_password: str = "admin123"
+
+    # JWT
+    jwt_secret_key: str = "change-me"
+    jwt_algorithm: str = "HS256"
+    jwt_expire_minutes: int = 1440
+
+    # 文件上传
+    upload_dir: str = "./data/uploads"
+    max_upload_size_mb: int = 50
+
+    # MinerU：留空用本地，填入 Token 走官方 API
+    mineru_api_token: str = ""
+
+    @property
+    def database_url(self) -> str:
+        """构建 SQLAlchemy 连接字符串"""
+        return (
+            f"mysql+pymysql://root:{self.mysql_root_password}"
+            f"@{self.mysql_host}:{self.mysql_port}/{self.mysql_database}"
+            f"?charset=utf8mb4"
+        )
+
+    class Config:
+        env_file = ".env"
+        env_file_encoding = "utf-8"
+
+
+settings = Settings()

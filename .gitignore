@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+.eggs/
+*.egg
+venv/
+.venv/
+
+# Node / Vue
+node_modules/
+frontend/dist/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# 本地工具/索引（不入库）
+.codegraph/
+.claude/
+*.tsbuildinfo
+
+# Docker
+data/uploads/*
+data/chromadb/
+
+# Environment
+.env
+!.env.example
+
+# OS
+.DS_Store
+Thumbs.db
