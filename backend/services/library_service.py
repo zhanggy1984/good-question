@@ -48,23 +48,18 @@ def delete_library(db: Session, library_id: int) -> None:
     """删除文档库
 
     MySQL 外键 ON DELETE CASCADE 自动级联删除 documents 与 chunks；
-    ChromaDB collection 与 ES 数据单独清理。
+    Milvus 的库 partition 单独清理。
     """
     lib = get_library(db, library_id)
 
-    # 先清理外部存储（ES / ChromaDB），再删 MySQL
+    # 先清理 Milvus 库 partition，再删 MySQL
     import logging
-    from utils.es_index import es_index
     from services import vector_store_service
     logger = logging.getLogger("native_rag")
     try:
-        es_index.delete_by_library(library_id)
-    except Exception as e:
-        logger.warning("[library.delete] ES 清理失败: %s", e)
-    try:
         vector_store_service.delete_library_collection(library_id)
     except Exception as e:
-        logger.warning("[library.delete] ChromaDB 清理失败: %s", e)
+        logger.warning("[library.delete] Milvus 清理失败: %s", e)
 
     db.delete(lib)
     db.commit()

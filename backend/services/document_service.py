@@ -1,4 +1,4 @@
-"""文档处理编排：抽取 → 清洗 → 切片 → 向量化 → MySQL → ES
+"""文档处理编排：抽取 → 清洗 → 切片 → 向量化(Milvus) → MySQL
 
 文档处理是耗时操作，在后台线程执行，不阻塞 API。
 DB 会话在线程内独立创建（SQLAlchemy session 非线程安全）。
@@ -15,7 +15,6 @@ from config import settings
 from database import SessionLocal
 from models import Chunk, Document
 from utils import chunker, mineru_extractor, text_cleaner
-from utils.es_index import es_index
 
 logger = logging.getLogger("native_rag")
 
@@ -88,7 +87,7 @@ def _document_exists(db: Session, document_id: int) -> bool:
 
 
 def process_document(document_id: int) -> None:
-    """后台执行完整处理管线（抽取 → 清洗 → 切片 → 向量化 → MySQL/ES）"""
+    """后台执行完整处理管线（抽取 → 清洗 → 切片 → 向量化 → MySQL/Milvus）"""
     db = SessionLocal()
     try:
         doc = db.query(Document).filter(Document.id == document_id).first()
@@ -128,7 +127,7 @@ def process_document(document_id: int) -> None:
             logger.info("[document.process] 文档已删除，中止处理 id=%s", document_id)
             return
 
-        # 阶段 4：向量化并存 ChromaDB（分批处理，on_progress 逐批把进度写库，前端轮询可见）
+        # 阶段 4：向量化并写入 Milvus（分批处理，on_progress 逐批把进度写库，前端轮询可见）
         t0 = time.time()
         from services import vector_store_service
 
@@ -147,7 +146,7 @@ def process_document(document_id: int) -> None:
             time.time() - t0, processed, len(chunks),
         )
 
-        # 阶段 5：存 MySQL chunks 表 + 写 ES 全文索引
+        # 阶段 5：存 MySQL chunks 表（Milvus 的 dense 向量 + BM25 全文已在阶段 4 写入）
         t0 = time.time()
         for c in chunks:
             db.add(Chunk(
@@ -159,19 +158,7 @@ def process_document(document_id: int) -> None:
                 metadata_json=c["metadata"],
             ))
         db.flush()
-        es_index.ensure_index()
-        es_index.bulk_add_chunks([
-            {
-                "_id": f"{doc.id}_{c['metadata']['chunk_index']}",
-                "chunk_id": 0,  # 占位，ES 不依赖 MySQL chunk id
-                "document_id": doc.id,
-                "library_id": doc.library_id,
-                "text": c["content"],
-                "metadata": c["metadata"],
-            }
-            for c in chunks
-        ])
-        logger.info("[document.process] 阶段5 MySQL/ES 写入完成 耗时=%.1fs chunk数=%s", time.time() - t0, len(chunks))
+        logger.info("[document.process] 阶段5 MySQL 写入完成 耗时=%.1fs chunk数=%s", time.time() - t0, len(chunks))
 
         # 阶段 6：更新文档状态
         doc.status = "ready"
@@ -183,14 +170,10 @@ def process_document(document_id: int) -> None:
         db.rollback()
         doc = db.query(Document).filter(Document.id == document_id).first()
         if doc:
-            # 清理已写入的向量/ES 数据，保持三处存储一致（MySQL 为准）
+            # 清理已写入的向量数据，保持存储一致（MySQL 为准）
             try:
                 from services import vector_store_service
-                vector_store_service.delete_by_document(doc.library_id, document_id)
-            except Exception:
-                pass
-            try:
-                es_index.delete_by_document(document_id)
+                vector_store_service.delete_by_document(document_id)
             except Exception:
                 pass
             doc.status = "failed"
@@ -202,24 +185,20 @@ def process_document(document_id: int) -> None:
 
 
 def delete_document(db: Session, document_id: int) -> None:
-    """删除文档：MySQL 级联 chunks + ChromaDB 向量 + ES 数据 + 磁盘文件"""
+    """删除文档：MySQL 级联 chunks + Milvus 向量 + 磁盘文件"""
     doc = db.query(Document).filter(Document.id == document_id).first()
     if doc is None:
         from utils.exceptions import NotFoundError
         raise NotFoundError("文档不存在")
 
-    library_id, file_path = doc.library_id, doc.file_path
+    file_path = doc.file_path
 
-    # 先清理外部存储（ChromaDB / ES），再删 MySQL
+    # 先清理 Milvus 向量，再删 MySQL
     from services import vector_store_service
     try:
-        vector_store_service.delete_by_document(library_id, document_id)
+        vector_store_service.delete_by_document(document_id)
     except Exception as e:
-        logger.warning("[document.delete] ChromaDB 清理失败: %s", e)
-    try:
-        es_index.delete_by_document(document_id)
-    except Exception as e:
-        logger.warning("[document.delete] ES 清理失败: %s", e)
+        logger.warning("[document.delete] Milvus 清理失败: %s", e)
 
     db.delete(doc)  # 外键 CASCADE 删除 chunks
     db.commit()

@@ -8,7 +8,6 @@ aiofiles==24.1.0
 sqlalchemy==2.0.36
 alembic==1.14.0
 pymysql==1.1.1
-chromadb-client==0.5.23
 
 # ── 认证 ──
 python-jose[cryptography]==3.3.0
@@ -21,8 +20,8 @@ pydantic-settings==2.7.0
 # ── 异步 HTTP ──
 httpx==0.28.1
 
-# ── 全文检索 ──
-elasticsearch==8.13.0
+# ── Milvus 向量库（统一语义检索 + BM25 全文检索，2.5.x 与服务端匹配）──
+pymilvus>=2.5,<2.6
 
 # ═══════════════════════════════════════
 # AI/ML 依赖（镜像体积会膨胀到 8GB+，首次构建慢）
@@ -32,7 +31,6 @@ elasticsearch==8.13.0
 langchain-core>=1.0,<2.0
 langchain-text-splitters>=1.0,<2.0
 langchain-huggingface>=1.0,<2.0
-langchain-chroma>=1.0,<2.0
 langchain-openai>=1.0,<2.0
 
 # ── 向量 & 模型 ──

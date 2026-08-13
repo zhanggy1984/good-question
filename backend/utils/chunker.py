@@ -82,7 +82,7 @@ def chunk_text(
 
     返回每个 chunk: {content, metadata}
     metadata 含 document_id/document_name/library_id/chunk_index/total_chunks/
-    heading_path/source_type/token_count 等，同时用于 MySQL 和 ChromaDB。
+    heading_path/source_type/token_count 等，同时用于 MySQL 和 Milvus。
     """
     splitter = RecursiveCharacterTextSplitter(
         separators=["\n\n", "\n", "。", "！", "？", "；", "，", " ", ""],

@@ -25,7 +25,9 @@ frontend/dist/
 
 # Docker
 data/uploads/*
-data/chromadb/
+
+# 迁移备份（旧数据快照，不入库）
+test-data/migration/
 
 # Environment
 .env

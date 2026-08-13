@@ -18,42 +18,76 @@ services:
       retries: 5
     restart: unless-stopped
 
-  chromadb:
-    image: chromadb/chroma:latest
-    container_name: rag-chromadb
-    volumes:
-      - chroma_data:/chroma/chroma
+  # Milvus 元数据存储
+  etcd:
+    container_name: rag-etcd
+    image: quay.io/coreos/etcd:v3.5.14
     environment:
-      - IS_PERSISTENT=TRUE
-      - PERSIST_DIRECTORY=/chroma/chroma
-      - ANONYMIZED_TELEMETRY=FALSE
-    ports:
-      - "${CHROMA_PORT:-8000}:8000"
+      - ETCD_AUTO_COMPACTION_MODE=revision
+      - ETCD_AUTO_COMPACTION_RETENTION=1000
+      - ETCD_QUOTA_BACKEND_BYTES=4294967296
+      - ETCD_SNAPSHOT_COUNT=50000
+    volumes:
+      - etcd_data:/etcd
+    command: etcd -advertise-client-urls=http://127.0.0.1:2379 -listen-client-urls http://0.0.0.0:2379 --data-dir /etcd
     healthcheck:
-      # chromadb 镜像无 curl/wget/python，用 bash /dev/tcp 探测 8000 端口
-      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/localhost/8000"]
-      interval: 10s
-      timeout: 5s
+      test: ["CMD", "etcdctl", "endpoint", "health"]
+      interval: 30s
+      timeout: 20s
       retries: 5
     restart: unless-stopped
 
-  elasticsearch:
-    build: ./elasticsearch
-    container_name: rag-es
+  # Milvus 对象存储
+  minio:
+    container_name: rag-minio
+    image: minio/minio:RELEASE.2023-03-20T20-16-18Z
     environment:
-      - discovery.type=single-node
-      - xpack.security.enabled=false
-      - ES_JAVA_OPTS=-Xms1g -Xmx1g
+      - MINIO_ACCESS_KEY=minioadmin
+      - MINIO_SECRET_KEY=minioadmin
     volumes:
-      - es_data:/usr/share/elasticsearch/data
+      - minio_data:/minio_data
+    command: minio server /minio_data
+    # minio 镜像是 scratch 极简基座（无 curl/bash 可做健康检查），故省略；
+    # milvus 对 minio 是 started 依赖（非 healthy），且 Milvus 自带对 MinIO 的重连
+    restart: unless-stopped
+
+  # Milvus Standalone：统一语义检索（dense）+ BM25 全文检索（sparse）
+  milvus:
+    container_name: rag-milvus
+    image: milvusdb/milvus:v2.5.4
+    command: ["milvus", "run", "standalone"]
+    security_opt:
+      - seccomp:unconfined
+    environment:
+      ETCD_ENDPOINTS: etcd:2379
+      MINIO_ADDRESS: minio:9000
+    volumes:
+      - milvus_data:/var/lib/milvus
     ports:
-      - "${ES_PORT:-9200}:9200"
+      - "${MILVUS_PORT:-19530}:19530"
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:9200/_cluster/health"]
-      interval: 15s
-      timeout: 10s
-      retries: 10
-      start_period: 30s
+      test: ["CMD", "curl", "-f", "http://localhost:9091/healthz"]
+      interval: 30s
+      start_period: 90s
+      timeout: 20s
+      retries: 5
+    depends_on:
+      - etcd
+      - minio
+    restart: unless-stopped
+
+  # Attu：Milvus 可视化管理 UI（collection/partition/数据浏览/查询）
+  attu:
+    container_name: rag-attu
+    image: zilliz/attu:v2.5.6
+    environment:
+      # MILVUS_URL 格式 host:port，不带 http:// 前缀；compose 内用服务名解析
+      MILVUS_URL: milvus:19530
+    ports:
+      - "${ATTU_PORT:-8000}:3000"
+    depends_on:
+      milvus:
+        condition: service_healthy
     restart: unless-stopped
 
   backend:
@@ -69,9 +103,7 @@ services:
     depends_on:
       mysql:
         condition: service_healthy
-      chromadb:
-        condition: service_healthy
-      elasticsearch:
+      milvus:
         condition: service_healthy
     restart: unless-stopped
 
@@ -86,7 +118,8 @@ services:
 
 volumes:
   mysql_data:
-  chroma_data:
-  es_data:
+  etcd_data:
+  minio_data:
+  milvus_data:
   uploads_data:
   model_cache:

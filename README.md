@@ -40,8 +40,8 @@
 | 产品形态 | Web 应用（浏览器访问），前端 + 后端 + 多个数据服务 |
 | 核心功能 | 文档库管理、文档上传自动处理、带溯源的智能问答 |
 | 支持格式 | PDF / DOCX / TXT / Markdown |
-| 技术栈 | FastAPI + LangChain 1.x + Vue 3 + MySQL + ChromaDB + Elasticsearch + DeepSeek |
-| 部署方式 | Docker Compose 一键启动（5 个服务） |
+| 技术栈 | FastAPI + LangChain 1.x + Vue 3 + MySQL + Milvus + DeepSeek |
+| 部署方式 | Docker Compose 一键启动（7 个服务） |
 | 交互方式 | 聊天问答 SSE 流式输出（文字逐字出现）+ 溯源卡片 |
 | 数据安全 | 多用户隔离：每个人的会话只能看到自己绑定文档库的内容 |
 
@@ -116,10 +116,10 @@
 系统用**三种检索手段 + 一道精排**保证"查得准"：
 
 1. **语义检索（向量）**：理解"意思"——"怎么搭环境"和"环境安装步骤"是同一意思，靠向量相似度匹配。
-2. **全文检索（关键词）**：精确匹配——专有名词、代码标识符、文件名这些语义检索常失灵的词，靠 IK 中文分词精确命中。
+2. **全文检索（关键词）**：精确匹配——专有名词、代码标识符、文件名这些语义检索常失灵的词，靠 Milvus BM25（内置中文分词）精确命中。
 3. **精排（Rerank）**：把两路召回的结果合并去重后，用一个专门的"相关性打分模型"逐段重新排序，取最相关的 top-3 给大模型。
 
-两路召回互补（语义找"相近的意思"，全文找"精确的词"），精排兜底质量。这是本系统检索质量的核心设计。
+两路召回互补（语义找"相近的意思"，全文找"精确的词"），精排兜底质量。这是本系统检索质量的核心设计。Milvus 将两路召回合一（`hybrid_search` + RRF），检索存储统一、可横向扩展。
 
 ---
 
@@ -143,19 +143,19 @@
                     │  认证 │ 文档处理管线 │ 混合检索 │ 聊天流式        │
                     └───┬─────────┬──────────┬──────────┬─────────────┘
                         │         │          │          │
-              ┌─────────▼──┐ ┌────▼─────┐ ┌──▼────────┐ ┌▼───────────┐
-              │ MySQL      │ │ ChromaDB │ │ Elasticsearch│ │ DeepSeek  │
-              │ 关系数据    │ │ 语义向量  │ │ 全文索引     │ │ 大模型(外部)│
-              │ 文档/用户/  │ │ 存向量    │ │ IK 中文分词  │ │ OpenAI 兼容│
-              │ 会话/消息   │ │          │ │            │ │ 流式接口   │
-              └────────────┘ └──────────┘ └────────────┘ └────────────┘
+              ┌─────────▼──┐ ┌────▼─────────▼──┐ ┌─────▼────────────┐
+              │ MySQL      │ │ Milvus Standalone│ │ DeepSeek(外部)   │
+              │ 关系数据    │ │ 语义(dense)+BM25 │ │ 大模型           │
+              │ 文档/用户/  │ │ 混合检索         │ │ OpenAI 兼容流式  │
+              │ 会话/消息   │ │ 依赖 etcd+MinIO  │ │                  │
+              └────────────┘ └─────────────────┘ └──────────────────┘
 ```
 
 一次问答的完整链路：
 
 ```
 用户提问
-  → backend 混合检索（语义 + 全文 并发召回 → 合并去重 → Rerank 精排 top-3）
+  → backend 混合检索（Milvus dense + BM25 → RRF 融合 → Rerank 精排 top-3）
   → 组装 prompt（检索片段 + 会话历史）
   → 直连 DeepSeek 流式生成（解析思考过程 + 正文）
   → 前端按 SSE 事件顺序渲染：先溯源卡片 → 再逐字答案 → 完成
@@ -166,16 +166,15 @@
 | 层 | 技术 | 选型理由 |
 |----|------|----------|
 | Web 框架 | **FastAPI + Uvicorn** | Python 异步性能好，SSE 流式天然支持，Pydantic 校验 |
-| AI 管线 | **LangChain 1.x**（core/text-splitters/openai/chroma） | 切片、检索器、LLM 封装标准化，1.x 版本更稳定 |
+| AI 管线 | **LangChain 1.x**（core/text-splitters/openai） | 切片、检索器、LLM 封装标准化，1.x 版本更稳定 |
 | 前端 | **Vue 3 + Naive UI + Pinia** | 组合式 API，SSE 流式渲染友好，组件库齐全 |
 | 文档解析 | **MinerU 3.4**（本地 CLI / 官方 API 可切换） | 中文 PDF/DOCX 结构化解析能力强，输出 Markdown 保留标题层级 |
 | 向量模型 | **jina-embeddings-v2-base-zh**（768 维，FastEmbed ONNX） | 中文语义强、可国内下载；ONNX 免 torch 依赖 |
 | 精排模型 | **bge-reranker-base**（sentence-transformers CrossEncoder） | 在候选片段间做相关性排序，比向量匹配更准 |
-| 向量库 | **ChromaDB Server** | 轻量、Docker 独立部署、metadata 过滤支持按文档删除 |
-| 全文检索 | **Elasticsearch 8.13 + IK 中文分词** | 精确关键词命中；单索引 + library_id 过滤实现库隔离 |
+| 检索存储 | **Milvus 2.5 Standalone** | dense 语义 + BM25 全文一体；单 collection + partition 库隔离；可横向扩展 |
 | 关系库 | **MySQL 8.0 + SQLAlchemy + Alembic** | 文档/用户/会话/消息持久化，迁移管理 |
 | 大模型 | **DeepSeek**（OpenAI 兼容协议，模型可切换） | 流式输出 + reasoning_content 思考过程 |
-| 部署 | **Docker Compose**（5 服务） | 一键启动，数据卷持久化，健康检查依赖编排 |
+| 部署 | **Docker Compose**（7 服务） | 一键启动，数据卷持久化，健康检查依赖编排 |
 
 ### 3.3 各服务职责
 
@@ -184,10 +183,13 @@
 | **backend** | rag-backend | 唯一业务服务：认证、文档处理、检索、聊天；8080 端口 |
 | **nginx** | rag-nginx | 前端静态文件 + `/api` 反向代理 + SSE 关缓冲；80 端口（对外唯一入口） |
 | **mysql** | rag-mysql | 持久化用户/文档/会话/消息/切片元数据 |
-| **chromadb** | rag-chromadb | 语义向量存储与检索 |
-| **elasticsearch** | rag-es | 全文索引与检索（IK 分词） |
+| **etcd** | rag-etcd | Milvus 元数据存储 |
+| **minio** | rag-minio | Milvus 对象存储 |
+| **milvus** | rag-milvus | dense 语义 + BM25 全文混合检索（standalone，可扩分布式） |
+| **attu** | rag-attu | Milvus 可视化管理 UI（collection/partition/数据浏览/查询）；8000 端口 |
 
 > 用户只需访问 `http://localhost`（nginx 80 端口），无需直接接触任何后端端口。
+> Milvus 可视化管理通过 `http://localhost:8000`（Attu，连接地址预填 `milvus:19530`）。
 
 ### 3.4 文档处理管线
 
@@ -199,8 +201,8 @@
   → ② 文本清洗   去乱码、规范空白（text_cleaner）
   → ③ 智能切片   RecursiveCharacterTextSplitter，按该文档的 chunk_size/overlap_token
                  Markdown 按标题分节；上限 MAX_CHUNKS=2000 防极端大文件
-  → ④ 向量化     jina 模型分批嵌入（每批 64 段，进度逐批写库）
-  → ⑤ 双写存储   MySQL chunks 表（完整元数据）+ Elasticsearch（全文）
+  → ④ 向量化     jina 模型分批嵌入（每批 64 段），连同 BM25 全文一并写入 Milvus（进度逐批写库）
+  → ⑤ 写 MySQL   chunks 表（完整元数据，为源数据；Milvus 统一承担语义与全文检索）
   → ⑥ 标记就绪   更新文档状态为 ready，记录 chunk_count
 ```
 
@@ -209,18 +211,16 @@
 - **切分配置按文档维度**：每篇文档在 `documents` 表里存自己的 `chunk_size` / `overlap_token`（上传时设置，默认 1024 / 102），切分阶段从文档记录读取。已上传文档不会自动重切。
 - **每阶段检查文档是否被删除**：文档被删除后处理线程尽快释放，不产生"孤儿"数据。
 - **进度可见**：向量化是耗时阶段，每批写入后把进度写库，前端轮询即可看到"处理中 N 段"。
-- **失败处理**：任何阶段失败 → 文档标记 failed + 错误信息；已写入的向量/索引自动清理，保证三处存储一致。
+- **失败处理**：任何阶段失败 → 文档标记 failed + 错误信息；已写入 Milvus 的向量自动清理，保证存储一致。
 
 ### 3.5 混合检索管线
 
 ```
 提问
-  → ① 语义检索   ChromaDB 向量相似度，取 top-3（理解"意思"）
-  → ② 全文检索   ES IK 分词精确匹配，取 top-3（匹配"关键词"）
-     ↑ 两路用 ThreadPoolExecutor 并发执行，只耗时较长的一路
-  → ③ 合并去重   按 document_id + chunk_index 去重
-  → ④ Rerank 精排  BGE-Reranker 对合并后的候选逐段打分，按分数倒序取 top-3
-  → ⑤ 无结果判定  最高分 < 0.2（SIMILARITY_THRESHOLD_LOW）才判定"文档无关"，返回空
+  → ① 混合检索   Milvus hybrid_search：dense 语义 top-3 + BM25 全文 top-3
+                 （同一 collection partition 内，服务端 RRF 融合去重，取 top-6 候选）
+  → ② Rerank 精排  BGE-Reranker 对融合后的候选逐段打分，按分数倒序取 top-3
+  → ③ 无结果判定  最高分 < 0.2（SIMILARITY_THRESHOLD_LOW）才判定"文档无关"，返回空
 ```
 
 设计决策（踩过的坑）：
@@ -228,7 +228,7 @@
 - **不设绝对阈值过滤**：实测 Rerank 的绝对分数不可靠——最相关的片段可能只得 0.27 分，用绝对阈值会误杀（曾导致某问题明明检索到了正确内容却返回空）。因此改为**相对排序**（取分数最高的 top-3），仅当最高分也低到离谱才判定无关。
 - **Rerank 输入只用正文**：打分时只用 chunk 正文（`page_content`），标题层级等元数据单独存在 metadata 里，不拼进打分文本。
 - **不用 LLM 改写问题**：曾用大模型先把口语化问题规范化再检索，实测改写收益趋零、还每次多花 2-4 秒，已停用，直接用原问题检索。
-- **ES 降级**：ES 不可用时该路返回空，不阻塞语义检索主链路。
+- **BM25 路降级**：BM25 路异常时自动降级为纯 dense 语义检索，不阻塞主链路。
 
 ### 3.6 LLM 流式生成
 
@@ -296,7 +296,7 @@ open http://localhost
 - 管理员：`ADMIN_USERNAME` / `ADMIN_PASSWORD`（.env.example 默认 `admin` / `change_me_admin`）
 - 普通用户：登录页点"去注册"自助注册
 
-> ⚠️ **镜像体积**：backend 镜像含 PyTorch(CPU) + MinerU + 模型依赖，约 **8-12GB**；首次构建会下载模型和依赖，耗时数十分钟。模型缓存挂载在 volume，重启不重复下载。ES 默认堆 1G，实际内存占用约 2GB，请确保宿主机内存充足。
+> ⚠️ **镜像体积与资源**：backend 镜像含 PyTorch(CPU) + MinerU + 模型依赖，约 **8-12GB**；首次构建会下载模型和依赖，耗时数十分钟。模型缓存挂载在 volume，重启不重复下载。Milvus Standalone + etcd + MinIO 内存占用约 2-4GB，请确保宿主机内存充足（建议 ≥ 8GB）。
 
 ## 5. 配置说明
 
@@ -309,6 +309,8 @@ open http://localhost
 | `EMBEDDING_MODEL_NAME` | 向量模型（FastEmbed 支持） | `jinaai/jina-embeddings-v2-base-zh` |
 | `RERANK_MODEL_NAME` | 精排模型 | `BAAI/bge-reranker-base`（更快的 CPU 选择） |
 | `SIMILARITY_THRESHOLD` | 相似度阈值 | `0.75` |
+| `MILVUS_HOST/PORT` | Milvus 连接地址 | `milvus` / `19530` |
+| `ATTU_PORT` | Attu 可视化 UI 端口 | `8000` |
 | `MINERU_API_TOKEN` | MinerU 官方 API Token（空=本地解析） | 空 |
 | `HF_ENDPOINT` | HuggingFace 下载镜像（国内加速） | `https://hf-mirror.com` |
 | `ADMIN_USERNAME/PASSWORD` | 管理员账号 | `admin` / `change_me_admin` |
@@ -320,11 +322,11 @@ open http://localhost
 
 ```
 native-rag/
-├── docker-compose.yml        # 5 服务编排（mysql/chromadb/es/backend/nginx）
+├── docker-compose.yml        # 7 服务编排（mysql/etcd/minio/milvus/attu/backend/nginx）
 ├── .env / .env.example       # 环境配置
 ├── init.sql                  # 建库脚本（表结构由 Alembic 迁移管理）
 ├── backend/                  # FastAPI + LangChain 后端
-│   ├── main.py               # 入口 + lifespan（模型预热/ES index/admin 种子）
+│   ├── main.py               # 入口 + lifespan（模型预热/admin 种子）
 │   ├── config.py             # pydantic-settings 读取 .env
 │   ├── api/                  # 路由层（薄）：auth/dashboard/library/document/session/chat
 │   ├── services/             # 业务逻辑：document_service(处理管线) / retrieval_service(混合检索)
@@ -332,7 +334,7 @@ native-rag/
 │   ├── models/               # SQLAlchemy ORM（6 张表）
 │   ├── schemas/              # Pydantic 请求/响应
 │   ├── middleware/           # JWT 鉴权 Depends
-│   ├── utils/                # mineru_extractor / text_cleaner / chunker / es_index
+│   ├── utils/                # mineru_extractor / text_cleaner / chunker
 │   └── alembic/              # 数据库迁移
 ├── frontend/                 # Vue 3 + Naive UI 前端
 │   ├── Dockerfile            # 多阶段：node 编译 → nginx 服务
@@ -343,7 +345,7 @@ native-rag/
 │       ├── views/            # 页面（登录/注册/仪表盘/文档库/文档/chunk详情/聊天）
 │       ├── components/       # 布局 + 溯源卡片等
 │       └── utils/sse.ts      # SSE 流式接收 + 断连重试
-└── elasticsearch/            # ES 镜像（官方镜像 + IK 分词插件）
+└── data/                     # 上传文件存储（uploads/）
 ```
 
 **后端代码分层**：`api/`（路由，薄）→ `services/`（业务逻辑）→ `models/` + `utils/`（数据与基础设施）。新增功能一般改 `api/` + `services/` 即可。
@@ -385,9 +387,10 @@ docker compose ps                             # 查看服务健康状态
 
 **如实说明当前已知的性能与边界问题：**
 
-1. **Rerank 是检索延迟的绝对瓶颈**：语义检索(约 0.5s) + ES 检索(约 0.5s) 并发后几乎可忽略，但 Rerank 精排在 CPU 上对 1024-token 文本对打分**每段约 5 秒**，一次问答检索环节约 19-31 秒。候选数无法压到 4 以下（语义 3 + ES 3 去重后仍有 4-5 个），且 chunk 越大打分越慢。
+1. **Rerank 是检索延迟的绝对瓶颈**：Milvus 混合检索（dense + BM25，RRF 融合）约 0.1s 可忽略，但 Rerank 精排在 CPU 上对 1024-token 文本对打分**每段约 5 秒**，一次问答检索环节约 15-31 秒。候选数由 Milvus `hybrid_search` 的 `limit` 控制（默认 6），且 chunk 越大打分越慢。
    - 可选方向：换更小的 rerank 模型、GPU 推理、或更激进的候选控制（均已评估，各有取舍，尚未落地）。
 2. **`.doc` 格式暂不支持**：MinerU 不支持 `.doc`（老版 Word），需先另存为 `.docx` 再上传。
 3. **本地 MinerU 解析较慢**：大 PDF 处理耗时取决于文档复杂度；如需加速可配置 `MINERU_API_TOKEN` 走官方 API（代价是文档内容上传到云端）。
 4. **模型全 CPU 推理**：embedding 与 rerank 均为 CPU，重负载场景可考虑 GPU 容器。
 5. **无 LLM 缓存**：相同的问与答会重复调用 DeepSeek（计费）。高频率场景可加缓存层。
+6. **Milvus 中文分词弱于原 ES IK**：内置 `chinese` analyzer 对领域词/自定义词典支持有限，专业术语精确命中可能略降（Milvus 自定义词典规划在 v3.0）。

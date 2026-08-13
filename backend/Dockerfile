@@ -17,9 +17,9 @@ RUN pip install --no-cache-dir "torch==2.13.0" "torchvision==0.28.0" \
     --index-url https://download.pytorch.org/whl/cpu \
     --timeout 180 --retries 15
 
-# Python 依赖（清华 pip 源；大包网络波动时用超时+重试兜底）
+# Python 依赖（阿里云 pip 源；清华源对 pip simple API 返回 403，2026-08 起改用阿里云；大包网络波动时用超时+重试兜底）
 RUN pip install --no-cache-dir -r requirements.txt \
-    -i https://pypi.tuna.tsinghua.edu.cn/simple \
+    -i https://mirrors.aliyun.com/pypi/simple \
     --timeout 180 --retries 15
 
 COPY . .

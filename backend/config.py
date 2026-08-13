@@ -9,26 +9,22 @@ class Settings(BaseSettings):
     mysql_host: str = "mysql"
     mysql_port: int = 3306
 
-    # ChromaDB
-    chroma_host: str = "chromadb"
-    chroma_port: int = 8000
-
-    # Elasticsearch
-    es_host: str = "elasticsearch"
-    es_port: int = 9200
+    # Milvus（统一语义检索 + BM25 全文检索存储）
+    milvus_host: str = "milvus"
+    milvus_port: int = 19530
 
     @property
-    def es_url(self) -> str:
-        """构建 ES 连接地址"""
-        return f"http://{self.es_host}:{self.es_port}"
+    def milvus_uri(self) -> str:
+        """构建 Milvus 连接地址"""
+        return f"http://{self.milvus_host}:{self.milvus_port}"
 
     # DeepSeek LLM
     deepseek_api_key: str = "sk-xxx"
     deepseek_base_url: str = "https://api.deepseek.com/v1"
     deepseek_model: str = "deepseek-v4-pro"
 
-    # Embedding
-    embedding_model_name: str = "BAAI/bge-small-zh-v1.5"
+    # Embedding（默认与 .env.example 一致；换模型须保证向量维度与 Milvus collection 一致）
+    embedding_model_name: str = "jinaai/jina-embeddings-v2-base-zh"
     embedding_device: str = "cpu"
     # FastEmbed 模型缓存目录（挂载 volume 持久化，避免容器重启丢模型）
     fastembed_cache_dir: str = "/root/.cache/fastembed"
