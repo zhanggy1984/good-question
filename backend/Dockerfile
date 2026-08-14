@@ -10,6 +10,7 @@ RUN sed -i 's|deb.debian.org|mirrors.tuna.tsinghua.edu.cn|g' /etc/apt/sources.li
         && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
+COPY requirements-dev.txt .
 
 # 先装 torch CPU 版 + 匹配的 torchvision（MinerU/rerank 依赖）
 # 版本严格匹配：torch 2.13 ↔ torchvision 0.28（避免 pip 误解析到远古版本）
@@ -19,6 +20,12 @@ RUN pip install --no-cache-dir "torch==2.13.0" "torchvision==0.28.0" \
 
 # Python 依赖（阿里云 pip 源；清华源对 pip simple API 返回 403，2026-08 起改用阿里云；大包网络波动时用超时+重试兜底）
 RUN pip install --no-cache-dir -r requirements.txt \
+    -i https://mirrors.aliyun.com/pypi/simple \
+    --timeout 180 --retries 15
+
+# 测试依赖（pytest）：体积相对 torch/MinerU 可忽略，装进镜像使
+# docker exec rag-backend pytest 开箱即用，不再需要每次临时 pip install
+RUN pip install --no-cache-dir -r requirements-dev.txt \
     -i https://mirrors.aliyun.com/pypi/simple \
     --timeout 180 --retries 15
 
