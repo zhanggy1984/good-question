@@ -170,7 +170,7 @@
 | 前端 | **Vue 3 + Naive UI + Pinia** | 组合式 API，SSE 流式渲染友好，组件库齐全 |
 | 文档解析 | **MinerU 3.4**（本地 CLI / 官方 API 可切换） | 中文 PDF/DOCX 结构化解析能力强，输出 Markdown 保留标题层级 |
 | 向量模型 | **jina-embeddings-v2-base-zh**（768 维，FastEmbed ONNX） | 中文语义强、可国内下载；ONNX 免 torch 依赖 |
-| 精排模型 | **bge-reranker-base**（sentence-transformers CrossEncoder） | 在候选片段间做相关性排序，比向量匹配更准 |
+| 精排模型 | **bge-reranker-v2-m3**（sentence-transformers CrossEncoder） | 在候选片段间做相关性排序，比向量匹配更准（多语言，较旧 v1-base 更准） |
 | 检索存储 | **Milvus 2.5 Standalone** | dense 语义 + BM25 全文一体；单 collection + partition 库隔离；可横向扩展 |
 | 关系库 | **MySQL 8.0 + SQLAlchemy + Alembic** | 文档/用户/会话/消息持久化，迁移管理 |
 | 大模型 | **DeepSeek**（OpenAI 兼容协议，模型可切换） | 流式输出 + reasoning_content 思考过程 |
@@ -307,8 +307,9 @@ open http://localhost
 | `DEEPSEEK_API_KEY` | DeepSeek API Key（**必填**） | - |
 | `DEEPSEEK_MODEL` | LLM 模型名 | `deepseek-v4-pro` |
 | `EMBEDDING_MODEL_NAME` | 向量模型（FastEmbed 支持） | `jinaai/jina-embeddings-v2-base-zh` |
-| `RERANK_MODEL_NAME` | 精排模型 | `BAAI/bge-reranker-base`（更快的 CPU 选择） |
-| `SIMILARITY_THRESHOLD` | 相似度阈值 | `0.75` |
+| `RERANK_MODEL_NAME` | 精排模型（多语言，较 v1-base 更准；CPU 下更慢） | `BAAI/bge-reranker-v2-m3` |
+| `SIMILARITY_THRESHOLD_LOW` | 无结果兜底阈值：rerank 最高分低于此值才判"文档无关"返回空 | `0.20` |
+| `SIMILARITY_THRESHOLD` | 相似度阈值（已被相对排序取代，仅保留兼容） | `0.75`（代码默认 `0.80`） |
 | `MILVUS_HOST/PORT` | Milvus 连接地址 | `milvus` / `19530` |
 | `ATTU_PORT` | Attu 可视化 UI 端口 | `8000` |
 | `MINERU_API_TOKEN` | MinerU 官方 API Token（空=本地解析） | 空 |
@@ -330,7 +331,8 @@ native-rag/
 │   ├── config.py             # pydantic-settings 读取 .env
 │   ├── api/                  # 路由层（薄）：auth/dashboard/library/document/session/chat
 │   ├── services/             # 业务逻辑：document_service(处理管线) / retrieval_service(混合检索)
-│   │                         #          chat_service(问答/记忆/流式) / vector_store_service / llm_service
+│   │                         #          chat_service(问答/记忆/流式) / embedding_service / vector_store_service / llm_service
+│   ├── scripts/              # migrate_to_milvus.py：从 MySQL chunks 幂等重灌 Milvus（升级迁移）
 │   ├── models/               # SQLAlchemy ORM（6 张表）
 │   ├── schemas/              # Pydantic 请求/响应
 │   ├── middleware/           # JWT 鉴权 Depends
@@ -345,6 +347,7 @@ native-rag/
 │       ├── views/            # 页面（登录/注册/仪表盘/文档库/文档/chunk详情/聊天）
 │       ├── components/       # 布局 + 溯源卡片等
 │       └── utils/sse.ts      # SSE 流式接收 + 断连重试
+├── test-data/                # Milvus 迁移验证脚本（chat 完整链路 / e2e 写入 / 旧数据验证）
 └── data/                     # 上传文件存储（uploads/）
 ```
 
@@ -374,6 +377,19 @@ docker exec -it rag-backend bash    # 进 backend 容器
 cd /app && python -m pytest tests/ -v
 ```
 
+**Milvus 数据迁移 / 迁移验证**（从旧版检索存储升级，或验证写入/检索链路）：
+
+```bash
+# ① 从 MySQL chunks 幂等重灌 Milvus（可重复执行，主键 upsert 不产生重复数据）
+docker exec -it rag-backend bash
+cd /app && python scripts/migrate_to_milvus.py
+
+# ② 迁移验证脚本（项目根目录，对 http://localhost 执行；登录凭据默认读环境变量 RAG_ADMIN_USER / RAG_ADMIN_PASS）
+python test-data/e2e.py                # 端到端：登录→建库→上传→轮询就绪（验证 Milvus 写入链路）
+python test-data/chat.py               # chat 完整链路：登录→建会话→提问→读 SSE 事件
+python test-data/verify_old_data.py    # 旧数据迁移后检索链路验证（MySQL 迁移 + Milvus 重灌）
+```
+
 **常用运维命令**：
 
 ```bash
@@ -387,7 +403,7 @@ docker compose ps                             # 查看服务健康状态
 
 **如实说明当前已知的性能与边界问题：**
 
-1. **Rerank 是检索延迟的绝对瓶颈**：Milvus 混合检索（dense + BM25，RRF 融合）约 0.1s 可忽略，但 Rerank 精排在 CPU 上对 1024-token 文本对打分**每段约 5 秒**，一次问答检索环节约 15-31 秒。候选数由 Milvus `hybrid_search` 的 `limit` 控制（默认 6），且 chunk 越大打分越慢。
+1. **Rerank 是检索延迟的绝对瓶颈**：Milvus 混合检索（dense + BM25，RRF 融合）约 0.1s 可忽略，但 Rerank 精排在 CPU 上对候选文本对打分是主要耗时（每段数秒，chunk 越大越慢），当前 `bge-reranker-v2-m3` 比旧 v1-base 更准但也更重。候选数由 Milvus `hybrid_search` 的 `limit` 控制（默认 6）。
    - 可选方向：换更小的 rerank 模型、GPU 推理、或更激进的候选控制（均已评估，各有取舍，尚未落地）。
 2. **`.doc` 格式暂不支持**：MinerU 不支持 `.doc`（老版 Word），需先另存为 `.docx` 再上传。
 3. **本地 MinerU 解析较慢**：大 PDF 处理耗时取决于文档复杂度；如需加速可配置 `MINERU_API_TOKEN` 走官方 API（代价是文档内容上传到云端）。
