@@ -32,10 +32,8 @@ class Settings(BaseSettings):
     # Rerank
     rerank_model_name: str = "BAAI/bge-reranker-v2-m3"
     rerank_device: str = "cpu"
-    # 检索相似度阈值：rerank 分数低于此值的 chunk 被过滤（宁缺毋滥）
-    similarity_threshold: float = 0.80
     # 无结果判定阈值：rerank 最高分低于此值才判定"文档无关"（返回空，不发 sources）
-    # 绝对阈值（similarity_threshold）经实测不可靠（相关 chunk 可能低分），改为相对排序 + 此低阈值兜底
+    # 绝对阈值经实测不可靠（相关 chunk 可能低分），改为相对排序 + 此低阈值兜底
     similarity_threshold_low: float = 0.20
 
     # Admin

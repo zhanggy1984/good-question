@@ -309,7 +309,6 @@ open http://localhost
 | `EMBEDDING_MODEL_NAME` | 向量模型（FastEmbed 支持） | `jinaai/jina-embeddings-v2-base-zh` |
 | `RERANK_MODEL_NAME` | 精排模型（多语言，较 v1-base 更准；CPU 下更慢） | `BAAI/bge-reranker-v2-m3` |
 | `SIMILARITY_THRESHOLD_LOW` | 无结果兜底阈值：rerank 最高分低于此值才判"文档无关"返回空 | `0.20` |
-| `SIMILARITY_THRESHOLD` | 相似度阈值（已被相对排序取代，仅保留兼容） | `0.75`（代码默认 `0.80`） |
 | `MILVUS_HOST/PORT` | Milvus 连接地址 | `milvus` / `19530` |
 | `ATTU_PORT` | Attu 可视化 UI 端口 | `8000` |
 | `MINERU_API_TOKEN` | MinerU 官方 API Token（空=本地解析） | 空 |
