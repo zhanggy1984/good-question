@@ -38,6 +38,14 @@ SYSTEM_PROMPT = """你是文档问答助手，基于提供的文档内容回答�
 参考资料（带来源编号）：
 {context}"""
 
+# 低置信兜底提示：检索到内容但相关性存疑时追加到 system prompt，
+# 让 LLM 不基于边缘相关片段勉强作答/编造（见 stream_chat 的 low_confidence 分支）
+LOW_CONFIDENCE_HINT = (
+    "\n\n注意：本次检索到的资料与问题相关性不确定。"
+    "若这些资料不足以支撑回答，请直接回答“文档中未找到相关信息”，"
+    "不要基于相关性存疑的资料勉强作答，更不要编造。"
+)
+
 
 # ════════ 会话 CRUD ════════
 
@@ -176,15 +184,32 @@ def _build_chain():
     return prompt | get_llm(streaming=True) | StrOutputParser()
 
 
-def _build_messages(summary: str, history: list, context: str, question: str) -> list[dict]:
-    """构建 DeepSeek API 的 messages（system + history + human）"""
+def _build_messages(
+    summary: str, history: list, context: str, question: str, low_confidence: bool = False
+) -> list[dict]:
+    """构建 DeepSeek API 的 messages（system + history + human）；低置信档追加兜底提示"""
     system = SYSTEM_PROMPT.format(summary=summary, context=context)
+    if low_confidence:
+        system += LOW_CONFIDENCE_HINT
     messages = [{"role": "system", "content": system}]
     for m in history:
         role = "user" if m.type == "human" else "assistant"
         messages.append({"role": role, "content": m.content})
     messages.append({"role": "user", "content": question})
     return messages
+
+
+def _is_low_confidence(max_score: float | None) -> bool:
+    """低置信判定：精排最高分落在 [similarity_threshold_low, rerank_low_confidence_threshold) 区间
+
+    低于 LOW 判"文档无关"（_rerank 已返回空，此处恒为 False）；等于/高于低置信阈值判正常。
+    抽成纯函数便于单元测试覆盖边界（见 tests/test_chat_service.py）。
+    """
+    return (
+        max_score is not None
+        and max_score >= settings.similarity_threshold_low
+        and max_score < settings.rerank_low_confidence_threshold
+    )
 
 
 def _stream_deepseek(messages: list[dict]):
@@ -241,9 +266,18 @@ def stream_chat(session_id: int, user_content: str):
             yield ("error", {"message": "会话不存在"})
             return
 
-        # 1. 混合检索（语义 + ES → rerank，低相似度已被过滤）
+        # 1. 混合检索（dense + BM25 → RRF 融合 → rerank）
         retriever = HybridRetriever(library_id=session.library_id)
         docs = retriever.invoke(user_content)
+
+        # 两级置信档：最高分 < LOW 判"文档无关"返回空；落在 [LOW, 低置信阈值) 判"相关性存疑"，
+        # 检索结果照常保留（不误杀），但提示 LLM 相关性存疑、不足以回答则如实说未找到
+        max_score = retriever.max_rerank_score
+        low_confidence = _is_low_confidence(max_score)
+        logger.info(
+            "[chat] 检索置信档 max_score=%s low_confidence=%s",
+            "无" if max_score is None else round(max_score, 3), low_confidence,
+        )
 
         # 2. 仅在检索到结果时推送 sources（无结果时不展示空引用来源）
         sources = []
@@ -266,7 +300,7 @@ def stream_chat(session_id: int, user_content: str):
         context = _format_docs(docs)
 
         # 4. 流式调用 DeepSeek（解析 reasoning_content 思考过程 + content 回答）
-        messages = _build_messages(summary, history, context, user_content)
+        messages = _build_messages(summary, history, context, user_content, low_confidence=low_confidence)
         full_answer = ""
         full_reasoning = ""
         try:

@@ -6,7 +6,7 @@ sys.path.insert(0, "/app")
 
 from langchain_core.documents import Document
 
-from services.retrieval_service import _milvus_hits_to_docs, _rerank
+from services.retrieval_service import HybridRetriever, _milvus_hits_to_docs, _rerank
 from services.vector_store_service import _hit_to_dict, add_chunks, hybrid_search
 
 
@@ -39,17 +39,19 @@ def test_rerank_orders_by_score():
             return [0.1, 0.9]
 
     with patch("services.retrieval_service._get_reranker", return_value=_FakeReranker()):
-        result = _rerank("查询", docs, top_k=1)
+        result, max_score = _rerank("查询", docs, top_k=1)
     assert result[0].page_content == "high"
+    assert max_score == 0.9
 
 
 def test_rerank_fallback_on_failure():
     """rerank 关键异常路径：精排失败时降级取前 top_k（不阻塞主链路）"""
     docs = [Document(page_content=f"doc{i}") for i in range(5)]
     with patch("services.retrieval_service._get_reranker", side_effect=RuntimeError("mock 失败")):
-        result = _rerank("查询", docs, top_k=3)
+        result, max_score = _rerank("查询", docs, top_k=3)
     assert len(result) == 3
     assert result == docs[:3]
+    assert max_score is None
 
 
 def test_rerank_low_score_returns_empty():
@@ -61,8 +63,38 @@ def test_rerank_low_score_returns_empty():
             return [0.05]
 
     with patch("services.retrieval_service._get_reranker", return_value=_LowScoreReranker()):
-        result = _rerank("查询", docs, top_k=1)
+        result, max_score = _rerank("查询", docs, top_k=1)
     assert result == []
+    assert max_score == 0.05
+
+
+def test_rerank_mid_score_returns_docs():
+    """低置信档：最高分落在 [LOW, 低置信阈值) 之间时，文档照常返回（保召回），分数透出"""
+    docs = [Document(page_content="边缘相关")]
+
+    class _MidScoreReranker:
+        def predict(self, pairs, batch_size=16, show_progress_bar=False):
+            return [0.4]
+
+    with patch("services.retrieval_service._get_reranker", return_value=_MidScoreReranker()):
+        result, max_score = _rerank("查询", docs, top_k=1)
+    assert len(result) == 1
+    assert result[0].page_content == "边缘相关"
+    assert max_score == 0.4
+
+
+def test_hybrid_retriever_propagates_max_rerank_score():
+    """HybridRetriever 将 rerank 精排最高分透出到 max_rerank_score（chat 层识别低置信档的依据）"""
+    docs = [Document(page_content="内容")]
+
+    with patch("services.retrieval_service.embed_query", return_value=[0.1, 0.2]), \
+            patch("services.retrieval_service.vector_store_service.hybrid_search",
+                  return_value=[{"text": "内容", "metadata": {}}]), \
+            patch("services.retrieval_service._rerank", return_value=(docs, 0.4)):
+        retriever = HybridRetriever(library_id=1)
+        result = retriever._get_relevant_documents("查询")
+    assert retriever.max_rerank_score == 0.4
+    assert result == docs
 
 
 def test_hit_to_dict():

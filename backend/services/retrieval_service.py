@@ -38,12 +38,13 @@ def _get_reranker():
     return CrossEncoder(settings.rerank_model_name, device="cpu")
 
 
-def _rerank(query: str, docs: list[Document], top_k: int = 3) -> list[Document]:
-    """BGE-Reranker 精排：相对排序取 top-k，仅当最高分极低才判定无关
+def _rerank(query: str, docs: list[Document], top_k: int = 3) -> tuple[list[Document], float | None]:
+    """BGE-Reranker 精排：返回 (top-k 文档, 精排最高分)，供调用方判断置信档
 
-    实测发现 rerank 绝对分数不可靠（最相关 chunk 可能只得 0.27 分），
-    故不再用绝对阈值过滤（避免误杀），改为：相对排序取 top-k，
-    仅当最高分低于 similarity_threshold_low（默认 0.2）才判定"文档无关"返回空。
+    绝对分数不可靠（实测最相关 chunk 可能只得 0.27 分），故不用绝对阈值过滤（避免误杀）：
+    - 相对排序取 top-k 照常返回；
+    - 仅当最高分低于 similarity_threshold_low（默认 0.2）才判定"文档无关"返回空；
+    - 最高分透出，chat 层据此识别"低置信"档（见 rerank_low_confidence_threshold）。
     """
     try:
         reranker = _get_reranker()
@@ -52,14 +53,16 @@ def _rerank(query: str, docs: list[Document], top_k: int = 3) -> list[Document]:
         ranked = sorted(
             zip(docs, scores), key=lambda x: x[1], reverse=True
         )
+        if not ranked:
+            return [], None
         # 无结果判定：最高分也低于低阈值（真正无关，宁缺毋滥）
-        if ranked and ranked[0][1] < settings.similarity_threshold_low:
-            return []
-        return [doc for doc, _ in ranked[:top_k]]
+        if ranked[0][1] < settings.similarity_threshold_low:
+            return [], ranked[0][1]
+        return [doc for doc, _ in ranked[:top_k]], ranked[0][1]
     except Exception as e:
         # rerank 失败降级：直接取合并后的前 top_k
         logger.warning("[rerank] 精排失败，降级取前 %s: %s", top_k, e)
-        return docs[:top_k]
+        return docs[:top_k], None
 
 
 class HybridRetriever(BaseRetriever):
@@ -67,6 +70,9 @@ class HybridRetriever(BaseRetriever):
 
     library_id: int = Field(description="文档库 id")
     candidate_k: int = Field(default=3, description="单路召回候选数（语义+BM25 各 3，控制 rerank 候选总量）")
+    max_rerank_score: float | None = Field(
+        default=None, description="本次检索 rerank 精排最高分（invoke 后读取，chat 层据此识别低置信档）"
+    )
 
     def _get_relevant_documents(
         self, query: str, *, run_manager=None
@@ -94,9 +100,11 @@ class HybridRetriever(BaseRetriever):
 
         # 2. Rerank 精排（用原 query 打分）
         t0 = time.time()
-        result = _rerank(search_query, docs, top_k=3)
+        result, max_score = _rerank(search_query, docs, top_k=3)
+        self.max_rerank_score = max_score
         logger.info(
-            "[retrieve] rerank 耗时=%.2fs 候选=%s 结果=%s",
+            "[retrieve] rerank 耗时=%.2fs 候选=%s 结果=%s 最高分=%s",
             time.time() - t0, len(docs), len(result),
+            "无" if max_score is None else round(max_score, 3),
         )
         return result

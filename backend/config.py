@@ -35,6 +35,10 @@ class Settings(BaseSettings):
     # 无结果判定阈值：rerank 最高分低于此值才判定"文档无关"（返回空，不发 sources）
     # 绝对阈值经实测不可靠（相关 chunk 可能低分），改为相对排序 + 此低阈值兜底
     similarity_threshold_low: float = 0.20
+    # 低置信判定阈值：最高分落在 [similarity_threshold_low, 此值) 视为"低置信"——
+    # 检索结果照常返回（保召回，避免重蹈绝对阈值误杀覆辙），但 chat 层会提示 LLM
+    # 相关性存疑、不足以回答则如实说"未找到"，防止基于边缘相关片段编造答案
+    rerank_low_confidence_threshold: float = 0.50
 
     # Admin
     admin_username: str = "admin"

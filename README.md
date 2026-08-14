@@ -220,7 +220,9 @@
   → ① 混合检索   Milvus hybrid_search：dense 语义 top-3 + BM25 全文 top-3
                  （同一 collection partition 内，服务端 RRF 融合去重，取 top-6 候选）
   → ② Rerank 精排  BGE-Reranker 对融合后的候选逐段打分，按分数倒序取 top-3
-  → ③ 无结果判定  最高分 < 0.2（SIMILARITY_THRESHOLD_LOW）才判定"文档无关"，返回空
+  → ③ 置信分级    最高分 < 0.2（SIMILARITY_THRESHOLD_LOW）判"文档无关"，返回空；
+                 最高分 ∈ [0.2, 0.5)（RERANK_LOW_CONFIDENCE_THRESHOLD）判"相关性存疑"，
+                 结果照常进 LLM，但提示其不足以回答则如实说"未找到"
 ```
 
 设计决策（踩过的坑）：
@@ -229,6 +231,7 @@
 - **Rerank 输入只用正文**：打分时只用 chunk 正文（`page_content`），标题层级等元数据单独存在 metadata 里，不拼进打分文本。
 - **不用 LLM 改写问题**：曾用大模型先把口语化问题规范化再检索，实测改写收益趋零、还每次多花 2-4 秒，已停用，直接用原问题检索。
 - **BM25 路降级**：BM25 路异常时自动降级为纯 dense 语义检索，不阻塞主链路。
+- **两级置信档**：0.2 以下的硬下线只拦"完全无关"；0.2~0.5 之间不丢弃检索结果（避免误杀相关但低分的片段），而是追加提示让 LLM 相关性存疑时如实说"未找到"，防止基于边缘相关片段编造答案。
 
 ### 3.6 LLM 流式生成
 
@@ -309,6 +312,7 @@ open http://localhost
 | `EMBEDDING_MODEL_NAME` | 向量模型（FastEmbed 支持） | `jinaai/jina-embeddings-v2-base-zh` |
 | `RERANK_MODEL_NAME` | 精排模型（多语言，较 v1-base 更准；CPU 下更慢） | `BAAI/bge-reranker-v2-m3` |
 | `SIMILARITY_THRESHOLD_LOW` | 无结果兜底阈值：rerank 最高分低于此值才判"文档无关"返回空 | `0.20` |
+| `RERANK_LOW_CONFIDENCE_THRESHOLD` | 低置信阈值：最高分落在 [LOW, 此值) 判"相关性存疑"，LLM 被提示如实回答 | `0.50` |
 | `MILVUS_HOST/PORT` | Milvus 连接地址 | `milvus` / `19530` |
 | `ATTU_PORT` | Attu 可视化 UI 端口 | `8000` |
 | `MINERU_API_TOKEN` | MinerU 官方 API Token（空=本地解析） | 空 |
