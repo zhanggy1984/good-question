@@ -48,11 +48,11 @@ def delete_library(db: Session, library_id: int) -> None:
     """删除文档库
 
     MySQL 外键 ON DELETE CASCADE 自动级联删除 documents 与 chunks；
-    Milvus 的库 partition 单独清理。
+    Milvus 的库数据（library_id 过滤）单独清理。
     """
     lib = get_library(db, library_id)
 
-    # 先清理 Milvus 库 partition，再删 MySQL
+    # 先清理 Milvus 库数据，再删 MySQL
     import logging
     from services import vector_store_service
     logger = logging.getLogger("native_rag")

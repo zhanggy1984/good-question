@@ -11,8 +11,12 @@
 宿主机运行：python verify_contract.py
 """
 import json
+import sys
 
 import httpx
+
+# 统一 UTF-8，避免 Windows 控制台 GBK 无法编码 ✅ 等字符
+sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 BASE = "http://127.0.0.1:8080"
 ADMIN = ("admin", "admin123")

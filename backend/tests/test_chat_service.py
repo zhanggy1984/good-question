@@ -13,7 +13,13 @@ import services.chat_service as cs
 from langchain_core.messages import AIMessage, HumanMessage
 
 from config import settings
-from services.chat_service import LOW_CONFIDENCE_HINT, _build_messages, _is_low_confidence
+from services.chat_service import (
+    LOW_CONFIDENCE_HINT,
+    _build_messages,
+    _is_low_confidence,
+    _is_smalltalk,
+)
+from services.retrieval_types import RetrievedChunk
 
 
 def test_build_messages_low_confidence_injects_hint():
@@ -50,6 +56,21 @@ def test_is_low_confidence_boundaries():
     assert _is_low_confidence((low + high) / 2) is True    # 区间中段
     assert _is_low_confidence(high) is False               # 右开：等于高阈值判正常
     assert _is_low_confidence(high + 0.1) is False         # 高于高阈值：正常
+
+
+def test_is_smalltalk_boundaries():
+    """闲聊粗判边界：纯问候/纯闲聊判 True；含查询意图（即便带问候前缀）判 False"""
+    assert _is_smalltalk("你好") is True
+    assert _is_smalltalk("您好，请问在吗") is True
+    assert _is_smalltalk("hi") is True
+    assert _is_smalltalk("你是谁") is True
+    assert _is_smalltalk("谢谢") is True
+    assert _is_smalltalk("工资发放日是几号") is False
+    assert _is_smalltalk("你好，工资发放日是几号") is False  # 带问候前缀的查询仍判非闲聊
+    assert _is_smalltalk("请事假怎么请") is False
+    assert _is_smalltalk("帮我总结一下") is False
+    assert _is_smalltalk("") is False
+    assert _is_smalltalk("   ") is False
 
 
 # ════════ 评测契约逻辑测试（2.0 契约改造）════════
@@ -174,17 +195,11 @@ def _patch_chat_pipeline(monkeypatch, docs=None, max_score=None, llm_events=None
 
 
 def test_stream_chat_event_sequence_no_docs(monkeypatch):
-    """无检索结果：meta → reasoning/token → usage → done，不推 tool_call/sources"""
-    _patch_chat_pipeline(monkeypatch, llm_events=[
-        {"type": "reasoning", "content": "思考"},
-        {"type": "content", "content": "答案"},
-        {"type": "usage", "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}},
-    ])
-    events = list(cs.stream_chat(1, "问题"))
+    """无检索结果 + 事实查询：meta → token(固定话术) → usage → done，不推 tool_call/sources、不调 LLM"""
+    _patch_chat_pipeline(monkeypatch)
+    events = list(cs.stream_chat(1, "工资发放日是几号"))
     types = [t for t, _ in events]
-    assert types[0] == "meta"
-    assert types[-1] == "done"
-    assert "usage" in types and types.index("usage") < types.index("done")
+    assert types == ["meta", "token", "usage", "done"]
     assert "tool_call" not in types and "sources" not in types
 
     meta = events[0][1]
@@ -193,17 +208,65 @@ def test_stream_chat_event_sequence_no_docs(monkeypatch):
     assert isinstance(meta["ts"], int)
 
     for t, d in events:
-        if t in ("reasoning", "token"):
+        if t == "token":
             assert d["content"] == d["delta"]
             assert isinstance(d["ts"], int)
 
 
+def test_stream_chat_no_docs_fact_query_skips_llm(monkeypatch):
+    """事实查询未命中：绕过 LLM 走固定话术（防幻觉），usage 合成 0，消息按固定话术保存"""
+    calls = {"stream": 0, "saved": None}
+
+    def _fake_stream(messages):
+        calls["stream"] += 1
+        raise AssertionError("事实查询未命中不应调用 LLM")
+
+    def _fake_save(db, session, user_content, answer, sources):
+        calls["saved"] = (user_content, answer, sources)
+        return 42
+
+    _patch_chat_pipeline(monkeypatch)
+    monkeypatch.setattr(cs, "_stream_deepseek", _fake_stream)
+    monkeypatch.setattr(cs, "_save_messages", _fake_save)
+
+    events = list(cs.stream_chat(1, "工资发放日是几号"))
+    assert calls["stream"] == 0, "事实查询未命中不应调用 LLM"
+    assert calls["saved"] == ("工资发放日是几号", cs._NOT_FOUND_ANSWER, [])
+
+    usage = next(d for t, d in events if t == "usage")
+    assert usage["total_tokens"] == 0
+    done = next(d for t, d in events if t == "done")
+    assert done["message_id"] == 42
+    tok = next(d for t, d in events if t == "token")
+    assert tok["content"] == cs._NOT_FOUND_ANSWER
+
+
+def test_stream_chat_no_docs_smalltalk_uses_llm(monkeypatch):
+    """无检索结果 + 闲聊：仍走 LLM 引导话术（不误伤场景5），usage 透传真实消耗"""
+    calls = {"stream": 0}
+
+    def _fake_stream(messages):
+        calls["stream"] += 1
+        yield {"type": "content", "content": "你好，我是文档问答助手..."}
+        yield {"type": "usage", "usage": {"prompt_tokens": 9, "completion_tokens": 1, "total_tokens": 10}}
+
+    _patch_chat_pipeline(monkeypatch)
+    monkeypatch.setattr(cs, "_stream_deepseek", _fake_stream)
+
+    events = list(cs.stream_chat(1, "你好"))
+    types = [t for t, _ in events]
+    assert calls["stream"] == 1, "闲聊应走 LLM"
+    assert types[0] == "meta" and types[-1] == "done"
+    assert "token" in types
+    usage = next(d for t, d in events if t == "usage")
+    assert usage["total_tokens"] == 10
+
+
 def test_stream_chat_tool_call_when_docs(monkeypatch):
     """有检索结果：meta → tool_call → sources → ... → usage → done，tool_call 结构完整"""
-    from types import SimpleNamespace
-    doc = SimpleNamespace(
+    doc = RetrievedChunk(
+        content="内容内容内容",
         metadata={"document_name": "测试.md", "heading_path": ["标题"], "chunk_index": 1, "total_chunks": 3},
-        page_content="内容内容内容",
     )
     _patch_chat_pipeline(monkeypatch, docs=[doc], max_score=0.9, llm_events=[
         {"type": "content", "content": "答案"},

@@ -7,7 +7,9 @@ ChromaDB/ES 是派生索引，MySQL chunks 表存了全文 + metadata_json 完�
     docker exec -it rag-backend bash
     cd /app && python scripts/migrate_to_milvus.py
 
-幂等：add_chunks 用 upsert（主键 {document_id}_{chunk_index}），可安全重跑。
+幂等：add_chunks 首次调用触发 llama_store._get_store()（旧 collection 缺 sparse_embedding
+字段会自动 drop 重建），且 add 前按 document_id 删旧数据（LlamaIndex add 是 insert 非
+upsert），可安全重跑。
 """
 import logging
 import sys
@@ -31,7 +33,7 @@ READ_BATCH = 500
 
 
 def migrate() -> int:
-    """逐库迁移：读取 MySQL chunks → 分批向量化写入 Milvus 对应 partition，返回总 chunk 数"""
+    """逐库迁移：读取 MySQL chunks → 分批向量化写入 Milvus（library_id 过滤隔离库），返回总 chunk 数"""
     db = SessionLocal()
     total = 0
     try:

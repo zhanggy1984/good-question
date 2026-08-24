@@ -6,8 +6,6 @@ from functools import lru_cache
 
 import httpx
 from langchain_core.messages import AIMessage, HumanMessage
-from langchain_core.output_parsers import StrOutputParser
-from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from sqlalchemy.orm import Session
 
 from config import settings
@@ -52,6 +50,33 @@ LOW_CONFIDENCE_HINT = (
     "若这些资料不足以支撑回答，请直接回答“文档中未找到相关信息”，"
     "不要基于相关性存疑的资料勉强作答，更不要编造。"
 )
+
+# 未命中固定话术：事实类查询在 docs 空时不调 LLM（实测空 context 下 DeepSeek 稳定编造
+# "合理答案"，如编造工资发放日为 10 号），直接如实回答；闲聊类请求才交给 LLM 走引导话术
+_NOT_FOUND_ANSWER = (
+    "根据当前文档库的内容，未找到与您问题直接相关的信息。"
+    "您可以换个问法再试，或确认该问题是否属于文档库涵盖的范围。"
+)
+
+# 闲聊/问候粗判关键词（仅用于 docs 空时区分"引导话术"与"如实未找到"）
+_SMALLTALK_KEYWORDS = (
+    "你好", "您好", "嗨", "哈喽", "嗨喽", "hello", "hi",
+    "自我介绍", "你是谁", "你能做什么", "你是干嘛的", "谢谢", "再见",
+)
+# 查询意图词：命中即判非闲聊（避免"你好，工资几号发"这类带问候前缀的查询被误判为闲聊）
+_QUERY_INTENT_KEYWORDS = ("？", "?", "什么", "几", "多少", "怎么", "如何", "为什么", "查询", "查找", "帮")
+
+
+def _is_smalltalk(text: str) -> bool:
+    """粗判问候/闲聊意图：docs 空时闲聊走 LLM 引导话术，事实查询走固定"未找到"话术
+
+    先排除明确查询意图（含疑问词/查询动词即便带问候前缀也算查询），再查问候关键词。
+    抽成纯函数便于单元测试覆盖边界（见 tests/test_chat_service.py）。
+    """
+    t = text.lower().strip()
+    if any(q in t for q in _QUERY_INTENT_KEYWORDS):
+        return False
+    return any(k in t for k in _SMALLTALK_KEYWORDS)
 
 
 # ════════ 会话 CRUD ════════
@@ -177,18 +202,8 @@ def _format_docs(docs) -> str:
         heading = [h for h in (meta.get("heading_path") or []) if h]
         if heading:
             src += f" > {' > '.join(heading)}"
-        parts.append(f"{src}\n{doc.page_content}")
+        parts.append(f"{src}\n{doc.content}")
     return "\n\n---\n\n".join(parts)
-
-
-def _build_chain():
-    """LCEL RAG 链：prompt + 流式 LLM + 字符串输出"""
-    prompt = ChatPromptTemplate.from_messages([
-        ("system", SYSTEM_PROMPT),
-        MessagesPlaceholder(variable_name="history"),
-        ("human", "{question}"),
-    ])
-    return prompt | get_llm(streaming=True) | StrOutputParser()
 
 
 def _build_messages(
@@ -340,7 +355,7 @@ def stream_chat(session_id: int, user_content: str):
             "ts": _ts(),
         })
 
-        # 1. 混合检索（dense + BM25 → RRF 融合 → rerank）
+        # 1. 混合检索（dense + 稀疏 → RRF 融合 → rerank）
         retriever = HybridRetriever(library_id=session.library_id)
         docs = retriever.invoke(user_content)
 
@@ -360,7 +375,7 @@ def stream_chat(session_id: int, user_content: str):
                 {
                     "document_name": d.metadata.get("document_name", "未知文档"),
                     "heading_path": [h for h in (d.metadata.get("heading_path") or []) if h],
-                    "chunk_content": d.page_content[:200],
+                    "chunk_content": d.content[:200],
                     "chunk_index": d.metadata.get("chunk_index"),
                     "total_chunks": d.metadata.get("total_chunks"),
                 }
@@ -384,6 +399,18 @@ def stream_chat(session_id: int, user_content: str):
         if not docs:
             # 未检索到任何参考内容：显式告知 LLM，避免空 context 下幻觉"文档找到"
             context = "（本次未检索到相关文档内容）"
+            # 防幻觉加固：事实类查询未命中直接走固定话术，不交给 LLM——实测空 context 下
+            # DeepSeek 会稳定编造"合理答案"（如编造工资发放日为每月 10 号）。仅闲聊类请求
+            # 继续走 LLM（SYSTEM_PROMPT 有专门的引导话术）。
+            if not _is_smalltalk(user_content):
+                answer = _NOT_FOUND_ANSWER
+                yield ("token", {"content": answer, "delta": answer, "ts": _ts()})
+                # 未调 LLM 无真实 token 消耗，合成 0 计数对齐评测契约（usage 必须在 done 前）
+                yield ("usage", {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "ts": _ts()})
+                assistant_id = _save_messages(db, session, user_content, answer, sources)
+                _compress_memory(db, session)
+                yield ("done", {"message_id": assistant_id, "ts": _ts()})
+                return
 
         # 4. 流式调用 DeepSeek（解析 reasoning_content 思考过程 + content 回答 + usage）
         messages = _build_messages(summary, history, context, user_content, low_confidence=low_confidence)

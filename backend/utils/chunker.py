@@ -1,14 +1,14 @@
-"""智能切片：结构感知 + RecursiveCharacterTextSplitter
+"""智能切片：结构感知 + LlamaIndex SentenceSplitter
 
 - chunk 大小与重叠 token 数按文档维度配置（默认 1024 / 102），上传时前端可设置
 - Markdown 按标题层级分节，chunk 带 heading_path 元数据（溯源）
-- 其他格式直接递归切分
+- 其他格式直接切分
 """
 import logging
 import re
 from functools import lru_cache
 
-from langchain_text_splitters import RecursiveCharacterTextSplitter
+from llama_index.core.node_parser import SentenceSplitter
 from transformers import AutoTokenizer
 
 from config import settings
@@ -84,12 +84,18 @@ def chunk_text(
     metadata 含 document_id/document_name/library_id/chunk_index/total_chunks/
     heading_path/source_type/token_count 等，同时用于 MySQL 和 Milvus。
     """
-    splitter = RecursiveCharacterTextSplitter(
-        separators=["\n\n", "\n", "。", "！", "？", "；", "，", " ", ""],
+    # 换 LlamaIndex SentenceSplitter（替换 RecursiveCharacterTextSplitter）：
+    # 主分隔符取段落（\n\n），超长段内再按中文句末标点切（secondary_chunking_regex）。
+    # 注意：SentenceSplitter 内部用 re.findall 提取匹配块（非 split 切分），正则必须是
+    # 「非分隔符块 + 可选分隔符」形态（默认 [^,\.;]+[,\.;]? 即此语义）；若只写 [。！？；\n]
+    # 会 findall 出纯标点、chunk 内容丢失。tokenizer 契约是 Callable[[str], list]
+    # （SentenceSplitter._token_size 对返回值做 len()），返回 token ids 而非 int。
+    splitter = SentenceSplitter(
         chunk_size=chunk_size,
         chunk_overlap=overlap_token,
-        length_function=_count_tokens,
-        is_separator_regex=False,
+        separator="\n\n",
+        secondary_chunking_regex=r"[^。！？；\n]+[。！？；]?",
+        tokenizer=lambda t: _get_tokenizer().encode(t),
     )
 
     results: list[dict] = []

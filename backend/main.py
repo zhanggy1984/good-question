@@ -36,7 +36,7 @@ async def lifespan(app: FastAPI):
     # 预热模型（embedding/rerank），避免首次提问等待模型加载
     try:
         from services.embedding_service import get_embeddings
-        from services.retrieval_service import _get_reranker
+        from services.rerank import _get_reranker
         get_embeddings()
         _get_reranker()
         logger.info("[lifespan] 模型预热完成")

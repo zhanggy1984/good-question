@@ -10,6 +10,7 @@ from functools import lru_cache
 import numpy as np
 from fastembed import TextEmbedding
 from langchain_core.embeddings import Embeddings
+from llama_index.core.embeddings import BaseEmbedding
 
 from config import settings
 
@@ -62,3 +63,33 @@ def embed_texts(texts: list[str]) -> list[list[float]]:
 def embed_query(text: str) -> list[float]:
     """向量化用户查询（输出已 L2 归一化，供 Milvus IP 检索）"""
     return _l2_normalize(get_embeddings().embed_query(text))
+
+
+class LlamaFastEmbed(BaseEmbedding):
+    """LlamaIndex BaseEmbedding 适配器：委托现有 embed_query/embed_texts
+
+    归一化（L2）由 embed_* 唯一出口保证，不引入 LlamaIndex 自带 FastEmbed 实现
+    （其输出未归一化，Milvus IP 检索前提会破坏）。写入路径 add_chunks 显式
+    embed_texts(batch) 后塞进 TextNode.embedding，本适配器供 LlamaIndex 侧
+    （如 rerank/Index 内部）兜底调用。
+    """
+
+    def __init__(self, **kwargs):
+        super().__init__(model_name=settings.embedding_model_name, **kwargs)
+
+    @classmethod
+    def class_name(cls) -> str:
+        return "LlamaFastEmbed"
+
+    def _get_query_embedding(self, query: str) -> list[float]:
+        return embed_query(query)
+
+    async def _aget_query_embedding(self, query: str) -> list[float]:
+        # BaseEmbedding 抽象方法，async 委托 sync（同步 embed 即满足）
+        return self._get_query_embedding(query)
+
+    def _get_text_embedding(self, text: str) -> list[float]:
+        return embed_texts([text])[0]
+
+    def _get_text_embeddings(self, texts: list[str]) -> list[list[float]]:
+        return embed_texts(texts)

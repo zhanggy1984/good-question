@@ -20,18 +20,24 @@ pydantic-settings==2.7.0
 # ── 异步 HTTP ──
 httpx==0.28.1
 
-# ── Milvus 向量库（统一语义检索 + BM25 全文检索，2.5.x 与服务端匹配）──
+# ── Milvus 向量库（LlamaIndex 统一管理：dense 语义检索 + BGE-M3 学习稀疏 + RRF 混合检索）──
 pymilvus>=2.5,<2.6
 
 # ═══════════════════════════════════════
 # AI/ML 依赖（镜像体积会膨胀到 8GB+，首次构建慢）
 # ═══════════════════════════════════════
 
-# ── LangChain 全家桶（1.x 版本；langchain-community 无 1.x，本项目未用到）──
+# ── LangChain 1.x（检索主链已迁移 LlamaIndex，仅保留记忆压缩与消息类型底座）──
 langchain-core>=1.0,<2.0
-langchain-text-splitters>=1.0,<2.0
-langchain-huggingface>=1.0,<2.0
 langchain-openai>=1.0,<2.0
+
+# ── LlamaIndex 0.12.x（独立生态，负责索引/检索/重排；与 LangChain 1.x 共存）──
+# SentenceTransformerRerank 精排内置于 llama-index-core（core/postprocessor），无需单独 postprocessor 包
+llama-index-core>=0.12,<0.13
+llama-index-vector-stores-milvus>=0.6,<0.7
+# FlagEmbedding：MilvusVectorStore 的默认稀疏编码器（BGE-M3 学习型稀疏，替代服务端 BM25；
+# bge-m3 模型缓存于 model_cache volume，重建不重下）
+FlagEmbedding==1.4.1
 
 # ── 向量 & 模型 ──
 # FastEmbed（ONNX 运行时，无 torch 依赖，避免 CUDA 大包下载）

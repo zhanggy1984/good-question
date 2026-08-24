@@ -146,7 +146,7 @@ def process_document(document_id: int) -> None:
             time.time() - t0, processed, len(chunks),
         )
 
-        # 阶段 5：存 MySQL chunks 表（Milvus 的 dense 向量 + BM25 全文已在阶段 4 写入）
+        # 阶段 5：存 MySQL chunks 表（Milvus 的 dense 向量 + 稀疏向量已在阶段 4 写入）
         t0 = time.time()
         for c in chunks:
             db.add(Chunk(

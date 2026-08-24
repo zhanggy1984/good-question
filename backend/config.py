@@ -9,7 +9,7 @@ class Settings(BaseSettings):
     mysql_host: str = "mysql"
     mysql_port: int = 3306
 
-    # Milvus（统一语义检索 + BM25 全文检索存储）
+    # Milvus（统一语义检索 + BGE-M3 稀疏混合检索存储）
     milvus_host: str = "milvus"
     milvus_port: int = 19530
 

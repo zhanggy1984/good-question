@@ -2,7 +2,7 @@
 
 > **多用户 RAG 文档问答系统**：文档上传即自动抽取 → 清洗 → 切片 → 向量化，之后基于文档库提问，大模型用**带来源标注、流式返回**的答案作答。私有知识有出处、可溯源、不编造，会话与文档库双隔离。
 
-本系统是**契约对齐的 RAG 演示项目**：7 服务一键启动、nginx 80 端口为唯一入口、Milvus 统一混合检索（dense + BM25 + RRF 融合 + Rerank 精排）、两级置信档防幻觉、SSE 事件流对齐评测契约 v1.0（`meta`/`tool_call`/`usage` + 全事件 `ts`）、45 项单元测试 + 契约运行时验证脚本开箱即用。
+本系统是**契约对齐的 RAG 演示项目**：7 服务一键启动、nginx 80 端口为唯一入口、LlamaIndex 统一混合检索（dense + BGE-M3 稀疏 + RRF 融合 + Rerank 精排）、两级置信档防幻觉、SSE 事件流对齐评测契约 v1.0（`meta`/`tool_call`/`usage` + 全事件 `ts`）、54 项单元测试 + 契约运行时验证脚本开箱即用。
 
 ---
 
@@ -38,7 +38,7 @@
 | 能力 | 实现 | 对应痛点 |
 |------|------|---------|
 | **私有文档知识化** | 上传即自动抽取 → 清洗 → 切片 → 向量化，问答只基于你上传的内容 | 私有文档问不到 |
-| **带溯源问答** | 混合检索（语义 + BM25 + Rerank）+ DeepSeek 生成，答案用 `[来源N]` 标注引用 | 答案没出处 |
+| **带溯源问答** | 混合检索（语义 + BGE-M3 稀疏 + Rerank）+ DeepSeek 生成，答案用 `[来源N]` 标注引用 | 答案没出处 |
 | **多用户隔离** | 文档库 + 会话双隔离，归属后端强制校验，普通用户 API 层也拿不到他人数据 | 知识无法隔离 |
 | **流式体验** | SSE 逐字返回，思考过程单独折叠展示，首包秒回、不干等 | 等不起 |
 
@@ -68,14 +68,15 @@
 
 ## 三、技术闪光点
 
-### 1. Milvus 统一混合检索：双存储合一
-检索存储从 **ChromaDB（语义）+ Elasticsearch（全文）双存储**，迁移为 **Milvus 2.5 Standalone 单存储**：dense 语义 + BM25 全文在同一 collection 内 `hybrid_search`，服务端 RRF 融合去重，partition 级做文档库隔离，可横向扩展。配套 `scripts/migrate_to_milvus.py` 幂等重灌脚本（主键 upsert，可重复执行）与 `test-data/verify_old_data.py` 迁移验证，升级不丢失数据。
+### 1. LlamaIndex 统一混合检索：双存储合一
+检索存储从 **ChromaDB（语义）+ Elasticsearch（全文）双存储**，迁移为 **Milvus 2.5 Standalone 单存储**，并由 **LlamaIndex 0.12** 统一托管：dense 语义（FastEmbed 768 维）+ **BGE-M3 学习稀疏**（替代服务端 BM25，query 与文档两端都编码，语义召回更准）在同一 collection 内混合检索，RRF 融合去重，**library_id 字段级过滤**做文档库隔离（替代 partition），可横向扩展。配套 `scripts/migrate_to_milvus.py` 幂等重灌脚本（按文档先删后灌，可重复执行）与 `test-data/verify_old_data.py` 迁移验证，升级不丢失数据。
 
 ### 2. 两级置信档：防幻觉，也不误杀
 实测 Rerank 的**绝对分数不可靠**——最相关的片段可能只得 0.27 分，用绝对阈值会误杀（曾导致"明明检索到了却返回空"）。因此：
 
 - **相对排序取 top-3**，不做绝对阈值过滤；
-- **最高分 < 0.2**（`SIMILARITY_THRESHOLD_LOW`）判"文档无关"，返回空、不发空引用，LLM 如实说"未找到"；
+- **最高分 < 0.2**（`SIMILARITY_THRESHOLD_LOW`）判"文档无关"，返回空、不发空引用；
+- **未命中不调 LLM**：实测空 context 下 DeepSeek 会**稳定编造**"合理答案"（曾把文档未提到的"工资发放日"编成每月 10 号），故检索为空时用 `_is_smalltalk()` 区分意图——**事实类查询直接返回固定"未找到"话术、不调用 LLM**（编造概率归零），仅问候/闲聊继续走 LLM 引导话术（带问候前缀的查询如"你好，工资几号发"不会被误判）；
 - **最高分 ∈ [0.2, 0.5)**（`RERANK_LOW_CONFIDENCE_THRESHOLD`）判"相关性存疑"——检索结果**照常保留**（保住召回、不误杀低分相关片段），但在 system prompt 追加提示，让 LLM"不足以回答就如实说未找到"，杜绝基于边缘相关片段编造。
 
 ### 3. 直连 DeepSeek 流式：思考过程 + 真实 token
@@ -113,7 +114,7 @@ event: error      LLM 调用失败兜底
 - 历史消息按**自增主键 `id`** 排序而非 `created_at`（秒级时间戳排序不稳定，曾导致多轮问答"串味"——第二问答出第一问的内容），用 `id` 排序后彻底解决。
 
 ### 7. 多用户会话隔离
-会话归属后端强制校验：普通用户即使改 URL / 直接调 API，也拿不到不属于自己的会话（403）。检索范围限定在会话绑定库的 partition 内，跨库天然隔离。
+会话归属后端强制校验：普通用户即使改 URL / 直接调 API，也拿不到不属于自己的会话（403）。检索范围以会话绑定库的 `library_id` 字段过滤，跨库天然隔离。
 
 ### 8. 幂等异步文档管线：失败不残留
 上传后后台线程异步处理（不阻塞上传响应），6 个阶段：`落盘 → ①抽取 → ②清洗 → ③切片 → ④向量化 → ⑤写库 → ⑥就绪`。关键保证：
@@ -139,12 +140,13 @@ graph TB
     end
     subgraph AI 服务
         DS["DeepSeek LLM<br/>生成 / 思考 / 记忆压缩"]
-        EMBED["FastEmbed jina-embeddings-v2-base-zh<br/>768 维（CPU）"]
+        LLAMAIX["LlamaIndex 0.12<br/>切片 / 索引 / 混合检索 / 重排"]
+        EMBED["FastEmbed jina-embeddings-v2-base-zh 768 维<br/>+ BGE-M3 学习稀疏（CPU）"]
         RERANK["BGE-Reranker v2-m3<br/>精排（CPU）"]
     end
     subgraph 数据层
         MYSQL[(MySQL 8<br/>用户/文档/切片/会话/消息)]
-        MILVUS[(Milvus 2.5 Standalone<br/>dense 语义 + BM25 全文<br/>依赖 etcd + MinIO)]
+        MILVUS[(Milvus 2.5 Standalone<br/>dense + sparse 双路混合检索<br/>依赖 etcd + MinIO)]
         ATTU["Attu :8000<br/>Milvus 可视化管理 UI"]
     end
 
@@ -152,10 +154,11 @@ graph TB
     NGINX --> API
     API -- SSE 流式 --> WEB
     API --> MYSQL
-    API --> MILVUS
+    API --> LLAMAIX
+    LLAMAIX --> MILVUS
+    LLAMAIX --> EMBED
+    LLAMAIX --> RERANK
     API --> DS
-    API --> EMBED
-    API --> RERANK
     API -.辅助.-> ATTU
 ```
 
@@ -163,8 +166,8 @@ graph TB
 
 ```
 用户提问
-  → ① 混合检索   Milvus hybrid_search：dense 语义 top-3 + BM25 全文 top-3
-                 （同一 partition 内，服务端 RRF 融合去重，取 top-6 候选）
+  → ① 混合检索   LlamaIndex hybrid_search：dense 语义 top-k + BGE-M3 稀疏 top-k
+                 （library_id 过滤限定库，RRF 融合去重，取 top-6 候选）
   → ② Rerank 精排 BGE-Reranker 对候选逐段打分，按分数倒序取 top-3
   → ③ 置信分级   最高分 < 0.2 → 判"文档无关"返回空；
                  最高分 ∈ [0.2, 0.5) → 判"相关性存疑"，结果照常进 LLM 但追加兜底提示
@@ -181,12 +184,12 @@ graph TB
 | 层 | 技术 | 说明 |
 |----|------|------|
 | 后端 | Python 3.11 + FastAPI + Uvicorn | async/await，OpenAPI 自动文档，SSE 流式原生支持 |
-| AI 管线 | LangChain 1.x（core/text-splitters/openai） | 切片、检索器、LLM 封装标准化，1.x 更稳定 |
+| AI 管线 | LlamaIndex 0.12 + LangChain 1.x | LlamaIndex 负责切片/索引/混合检索/重排；LangChain 仅保留记忆压缩（ChatOpenAI） |
 | 前端 | Vue 3 + Naive UI + Pinia | 组合式 API，SSE 流式渲染友好 |
 | 文档解析 | MinerU 3.4.4（pipeline backend） | 中文 PDF/DOCX 结构化解析，失败降级 PyMuPDF/python-docx |
 | 向量模型 | jina-embeddings-v2-base-zh（768 维，FastEmbed ONNX） | 中文语义强、可国内下载，ONNX 免 torch 依赖 |
 | 精排模型 | BGE-Reranker v2-m3（CrossEncoder） | 候选间相关性排序，比向量匹配更准 |
-| 检索存储 | Milvus 2.5 Standalone | dense 语义 + BM25 全文一体，RRF 融合，partition 库隔离 |
+| 检索存储 | Milvus 2.5 Standalone（LlamaIndex 托管） | dense + BGE-M3 稀疏双路，RRF 融合，library_id 字段级库隔离 |
 | 关系库 | MySQL 8.0 + SQLAlchemy 2 + Alembic | 6 张表，迁移统一管理 |
 | 大模型 | DeepSeek（OpenAI 兼容协议，模型可切换） | 流式输出 + reasoning_content 思考过程 + usage |
 | 部署 | Docker Compose（7 服务） | 一键启动，数据卷持久化，健康检查编排 |
@@ -316,20 +319,22 @@ good-question/
 ├── prd.txt                   # PRD 需求（原始需求）
 ├── solution.md               # 技术方案（v2 归档存根，检索实现以本 README 为准）
 ├── verify_contract.py        # SSE 契约运行时验证（宿主机直接运行）
-├── backend/                  # FastAPI + LangChain 后端
+├── backend/                  # FastAPI 后端（RAG 检索层基于 LlamaIndex，LangChain 仅记忆压缩）
 │   ├── main.py               # 入口 + lifespan（admin 种子 / 模型预热 / 路由注册）
 │   ├── config.py             # pydantic-settings 读取 .env
 │   ├── api/                  # 路由层（薄）：auth/dashboard/library/document/session/chat/contracts
 │   │   └── contracts.py      # GET /api/contracts 契约清单（评测平台自动发现）
 │   ├── services/             # 业务逻辑：document(管线) / retrieval(混合检索) / chat(问答/记忆/流式)
-│   │                         #          dashboard / library / auth / embedding / vector_store / llm
+│   │                         #          llama_store(LlamaIndex 隔离层) / rerank(精排+置信档)
+│   │                         #          retrieval_types(接缝数据类) / vector_store(门面)
+│   │                         #          dashboard / library / auth / embedding / llm
 │   ├── scripts/              # migrate_to_milvus.py：从 MySQL chunks 幂等重灌 Milvus
 │   ├── models/               # SQLAlchemy ORM（6 张表）
 │   ├── schemas/              # Pydantic 请求/响应
 │   ├── middleware/           # JWT 鉴权 Depends
 │   ├── utils/                # mineru_extractor / mineru_api / text_cleaner / chunker / security / exceptions
 │   ├── alembic/              # 数据库迁移（versions/：0001~0003）
-│   ├── tests/                # 单元测试（45 个测试函数，pytest 已内置镜像）
+│   ├── tests/                # 单元测试（54 个测试函数，pytest 已内置镜像）
 │   ├── requirements.txt      # 生产依赖
 │   └── requirements-dev.txt  # 测试依赖（pytest，已装进镜像）
 ├── frontend/                 # Vue 3 + Naive UI 前端
@@ -354,7 +359,7 @@ good-question/
 
 | 层 | 内容 | 说明 |
 |----|------|------|
-| 单元测试 | `backend/tests/` 45 个测试函数 | 安全 / 清洗 / 切片 / 文档服务 / embedding / 检索 / 聊天服务（含两级置信档边界），纯函数级，不依赖外部服务 |
+| 单元测试 | `backend/tests/` 54 个测试函数 | 安全 / 清洗 / 切片 / 文档服务 / embedding / 检索 / 聊天服务 / llama_store（含两级置信档边界、闲聊粗判与未命中固定话术分支），纯函数级，不依赖外部服务 |
 | 契约验证 | `verify_contract.py` | 运行时读真实 SSE 事件流，断言事件序（meta 首、usage 在 done 前）与字段完整（meta/tool_call/usage/reasoning/token/ts） |
 | 迁移验证 | `test-data/e2e.py` / `chat.py` / `verify_old_data.py` | 登录→建库→上传→就绪 / chat 完整链路读 SSE / 旧数据重灌后检索验证 |
 | 前端构建 | `npm run build` | 改了前端代码必须先 build，否则 nginx 里是旧页面 |
@@ -455,18 +460,18 @@ python verify_contract.py                                          # 宿主机�
 
 **如实说明当前已知的性能与边界问题：**
 
-1. **Rerank 是检索延迟的绝对瓶颈**：Milvus 混合检索（dense + BM25，RRF 融合）约 0.1s 可忽略，但 Rerank 精排在 CPU 上对候选文本对打分是主要耗时（每段数秒，chunk 越大越慢），当前 `bge-reranker-v2-m3` 比旧 v1-base 更准但也更重。候选数由 Milvus `hybrid_search` 的 `limit` 控制（默认 6）。
-   - 可选方向：换更小的 rerank 模型、GPU 推理、或更激进的候选控制（均已评估，各有取舍，尚未落地）。
-2. **模型全 CPU 推理**：embedding 与 rerank 均为 CPU，重负载场景可考虑 GPU 容器。
+1. **BGE-M3 稀疏编码 + Rerank 是延迟主因**：dense 检索约 0.1s 可忽略，但 BGE-M3 学习稀疏需对 query 跑 bge-m3 模型编码（CPU 数秒级），Rerank 精排对候选打分仍是主要耗时（每段数秒，chunk 越大越慢）。
+   - **离线入库代价**：BGE-M3 学习稀疏编码 CPU 每批 64 条约 3.5 分钟，大批量重灌（migrate）耗时以十分钟计——这是从服务端 BM25 迁移到学习稀疏的固有性能代价（换 GPU 推理可缓解）。
+   - 可选方向：GPU 推理、更小的 rerank 模型、或更激进的候选控制（均已评估，各有取舍，尚未落地）。
+2. **模型全 CPU 推理**：embedding、稀疏编码与 rerank 均为 CPU，重负载场景可考虑 GPU 容器。
 3. **无 LLM 缓存**：相同的问与答会重复调用 DeepSeek（计费）。高频率场景可加缓存层。
-4. **Milvus 中文分词弱于原 ES IK**：内置 `chinese` analyzer 对领域词/自定义词典支持有限，专业术语精确命中可能略降（Milvus 自定义词典规划在 v3.0）。
 
 ---
 
 ## 文档索引
 
 - **PRD 需求**：[prd.txt](prd.txt)（原始功能需求）
-- **技术方案**：[solution.md](solution.md)（v2 归档存根；检索存储已演进为 Milvus，实现细节以本 README 四/五章为准）
+- **技术方案**：[solution.md](solution.md)（v2 归档存根；检索层已演进为 LlamaIndex + Milvus，实现细节以本 README 四/五章为准）
 - **SSE 契约验证**：[verify_contract.py](verify_contract.py)（契约事件流运行时断言）
 - **一键演示数据**：[test-data/seed_demo.py](test-data/seed_demo.py)（重建"演示知识库"并打印 6 个场景问题清单）
 - **Milvus 迁移配套**：[backend/scripts/migrate_to_milvus.py](backend/scripts/migrate_to_milvus.py)、[test-data/](test-data/)（e2e / chat / verify_old_data + 升级验证文档）

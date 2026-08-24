@@ -51,7 +51,7 @@ services:
     # milvus 对 minio 是 started 依赖（非 healthy），且 Milvus 自带对 MinIO 的重连
     restart: unless-stopped
 
-  # Milvus Standalone：统一语义检索（dense）+ BM25 全文检索（sparse）
+  # Milvus Standalone：统一语义检索（dense）+ BGE-M3 学习稀疏（sparse）混合检索
   milvus:
     container_name: rag-milvus
     image: milvusdb/milvus:v2.5.4
@@ -95,6 +95,12 @@ services:
     container_name: rag-backend
     env_file:
       - .env
+    # HF 模型全部走离线缓存（model_cache volume）：hf_hub 0.36 走镜像站校验会失败，
+    # bge-m3（FlagEmbedding 稀疏）/ bge-reranker / jina-embeddings 均由缓存加载。
+    # 缺失会导致 BGEM3SparseEmbeddingFunction 构造时 HF 校验异常（其 except 吞错并误导为"未安装"）。
+    environment:
+      - HF_HUB_OFFLINE=1
+      - TRANSFORMERS_OFFLINE=1
     volumes:
       - uploads_data:/app/data/uploads
       - model_cache:/root/.cache
