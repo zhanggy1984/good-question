@@ -328,11 +328,15 @@ def _is_low_confidence(max_score: float | None) -> bool:
 
 @lru_cache(maxsize=1)
 def _git_sha() -> str:
-    """尽力取当前 git commit sha（进程内缓存，仅首次 spawn 子进程；容器内可能无 .git）
+    """取当前 git commit sha（进程内缓存，仅首次 spawn 子进程；容器内可能无 .git）
 
-    每次 chat 请求都 spawn 一次 git 子进程不划算，commit 在进程生命周期内不变，
-    故用 lru_cache 缓存一次。
+    镜像内无 .git，构建时经 --build-arg GIT_SHA 注入环境变量，优先读它（docker compose build）；
+    本地开发无 GIT_SHA 时 fallback git 子进程。commit 在进程生命周期内不变，故缓存一次。
     """
+    import os
+    injected = os.environ.get("GIT_SHA", "").strip()
+    if injected:
+        return injected
     try:
         import subprocess
         return subprocess.run(

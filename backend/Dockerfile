@@ -29,6 +29,11 @@ RUN pip install --no-cache-dir -r requirements-dev.txt \
     -i https://mirrors.aliyun.com/pypi/simple \
     --timeout 180 --retries 15
 
+# 构建时注入 git 短 sha（docker compose build --build-arg GIT_SHA=$(git rev-parse --short HEAD)）
+# 镜像内无 .git，chat_service._git_sha() 运行时优先读此环境变量
+ARG GIT_SHA=unknown
+ENV GIT_SHA=$GIT_SHA
+
 COPY . .
 
 EXPOSE 8080

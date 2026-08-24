@@ -131,6 +131,7 @@ def test_classify_intent_history_fallback():
 
 def test_git_sha_success(monkeypatch):
     """_git_sha：git 子进程可用时取到短 sha（进程内缓存，首次调用后不再 spawn）"""
+    monkeypatch.delenv("GIT_SHA", raising=False)  # 环境变量优先逻辑不应干扰子进程路径
     cs._git_sha.cache_clear()
     class _Ok:
         stdout = "abc123\n"
@@ -141,11 +142,23 @@ def test_git_sha_success(monkeypatch):
 
 def test_git_sha_failure_returns_empty(monkeypatch):
     """_git_sha：子进程异常（容器内无 .git）时尽力返回空串，不抛错"""
+    monkeypatch.delenv("GIT_SHA", raising=False)
     cs._git_sha.cache_clear()
     def _boom(*a, **k):
         raise FileNotFoundError("no git")
     monkeypatch.setattr("subprocess.run", _boom)
     assert cs._git_sha() == ""
+    cs._git_sha.cache_clear()
+
+
+def test_git_sha_env_priority(monkeypatch):
+    """_git_sha：构建注入的 GIT_SHA 环境变量优先——即使 git 子进程失败（镜像内无 .git）也返回注入值"""
+    monkeypatch.setenv("GIT_SHA", "10ece5f")
+    cs._git_sha.cache_clear()
+    def _boom(*a, **k):
+        raise FileNotFoundError("no git")
+    monkeypatch.setattr("subprocess.run", _boom)
+    assert cs._git_sha() == "10ece5f"
     cs._git_sha.cache_clear()
 
 
