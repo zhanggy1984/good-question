@@ -2,7 +2,7 @@
 
 > **多用户 RAG 文档问答系统**：文档上传即自动抽取 → 清洗 → 切片 → 向量化，之后基于文档库提问，大模型用**带来源标注、流式返回**的答案作答。私有知识有出处、可溯源、不编造，会话与文档库双隔离。
 
-本系统是**契约对齐的 RAG 演示项目**：7 服务一键启动、nginx 80 端口为唯一入口、LlamaIndex 统一混合检索（dense + BGE-M3 稀疏 + RRF 融合 + Rerank 精排）、两级置信档防幻觉、SSE 事件流对齐评测契约 v1.0（`meta`/`tool_call`/`usage` + 全事件 `ts`）、54 项单元测试 + 契约运行时验证脚本开箱即用。
+本系统是**契约对齐的 RAG 演示项目**：7 服务一键启动、nginx 80 端口为唯一入口、LlamaIndex 统一混合检索（dense + BGE-M3 稀疏 + RRF 融合 + Rerank 精排）、function calling 编排（LLM 自主决定是否检索）+ 两级置信档防幻觉、SSE 事件流对齐评测契约 v1.0（`meta`/`tool_call`/`usage` + 全事件 `ts`）、54 项单元测试 + 契约运行时验证脚本开箱即用。
 
 ---
 
@@ -61,7 +61,7 @@
 
 ### 对评测 / 验收方
 - **接口自动发现**：公开 `GET /api/contracts` 声明本 agent 的 LLM 接口与场景清单，平台脚手架直接读取，无需人工配置；
-- **契约对齐**：SSE 事件流严格对齐评测契约（`meta`/`tool_call`/`usage` + 全事件 `ts`），`reasoning`/`token` 双字段兼容前端与评测侧，`usage` 透传真实 token 消耗；
+- **契约对齐**：LLM 自主决定是否检索（function calling 编排），SSE 事件流严格对齐评测契约（`meta`/`tool_call`/`usage` + 全事件 `ts`），`reasoning`/`token` 双字段兼容前端与评测侧，`usage` 透传真实 token 消耗；
 - **一键验证**：`python verify_contract.py` 运行时验证完整事件流，字段缺失、顺序错误立即暴露。
 
 ---
@@ -85,21 +85,26 @@
 - `reasoning_content`（思考过程）与 `content`（正式答案）分流推送，前端把思考过程单独折叠展示；
 - `stream_options.include_usage` 显式开启，透传**真实 token 消耗**（默认不返回），供计费与评测。
 
-### 4. SSE 事件流对齐评测契约（meta / tool_call / usage + ts）
-`/api/chat/{session_id}` 的 SSE 事件序对齐评测契约 v1.0（路径 A：保留原事件名，前端零改动）：
+### 4. Function Calling 编排 + SSE 事件流对齐评测契约
+`/api/chat/{session_id}` 采用**二期 function calling 编排**：LLM 第一轮带 `hybrid_retrieve` 工具**自主决定是否检索**（不调就不检），命中后经 tool 消息回传结果、第二轮基于检索结果作答；检索空走规则意图分类兜底（query→如实"未找到"、unknown→引导澄清、smalltalk→LLM 引导寒暄），防幻觉不变。每次请求的 tool 决策以 JSON 行结构化日志落盘（`kind=tool_decision`），监控 LLM 决策与规则判断的一致性（`rule_agree`）。
+
+事件序对齐评测契约 v1.0（路径 A：保留原事件名，前端零改动）——不同路径事件不同，前端只消费 `sources`/`reasoning`/`token`/`done`/`error`：
 
 ```
 event: meta       环境快照（agent/model/interface/contract_version/git_sha/knowledge_version/ts）
-event: tool_call  检索外显为标准工具调用（name=hybrid_retrieve，仅检索到结果时）
-event: sources    溯源卡片数据（仅检索到结果时）
-event: reasoning  DeepSeek 思考过程（content + delta + ts，多段）
+event: reasoning  DeepSeek 思考过程（content + delta + ts，多段）——首轮含"是否检索"的决策思考
+event: tool_call  检索外显为标准工具调用（name=hybrid_retrieve，LLM 决定检索时出现，result 含 source_count/max_score/confidence_band）
+event: sources    溯源卡片数据（检索命中时）
+event: reasoning  DeepSeek 第二轮思考（可选）
 event: token      正式答案逐字推送（content + delta + ts，多段）
-event: usage      真实 token 消耗（prompt/completion/total_tokens + ts，done 之前）
+event: usage      真实 token 消耗（多轮合并，prompt/completion/total_tokens + ts，done 之前）
 event: done       完成，携带 message_id
 event: error      LLM 调用失败兜底
 ```
 
 - **全事件带 `ts`**（unix 毫秒），`reasoning`/`token` 的 data 同时含 `content` + `delta`，前端读 `content`、评测平台经 field_map 读 `delta`，两侧都兼容；
+- **所有请求第一轮必调 LLM**（判断是否检索），`usage` 恒反映真实消耗——一期"不调 LLM、usage 全 0"的路径已不存在；
+- **检索由 LLM 自主决定**：`tool_call`/`sources` 不再无条件出现，闲聊/直接回答路径只有 `meta → reasoning/token → usage → done`；
 - `meta` 中 `knowledge_version` 以**该会话文档库**最近上传时间为锚（按 `library_id` 过滤，多库部署不串库）；
 - 公开 `GET /api/contracts` 声明接口与 4 个场景清单，平台自动发现；
 - 前端 `sse.ts` 只消费 `sources`/`reasoning`/`token`/`done`/`error`，新增的 `meta`/`tool_call`/`usage` 事件自然忽略——路径 A，前端无需改动；
@@ -173,7 +178,7 @@ graph TB
                  最高分 ∈ [0.2, 0.5) → 判"相关性存疑"，结果照常进 LLM 但追加兜底提示
   → ④ 组装 prompt（检索片段 + 最近 3 轮历史 + 摘要）
   → ⑤ 直连 DeepSeek 流式生成（reasoning_content 思考 + content 正文 + usage）
-  → ⑥ SSE 事件序：meta → tool_call/sources? → reasoning*/token* → usage → done
+  → ⑥ SSE 事件序：meta → reasoning* → [tool_call → sources]? → reasoning*/token* → usage → done（LLM 自主决定是否检索）
   → ⑦ 前端按序渲染：溯源卡片 → 思考折叠 → 逐字答案 → 完成
 ```
 
@@ -191,7 +196,7 @@ graph TB
 | 精排模型 | BGE-Reranker v2-m3（CrossEncoder） | 候选间相关性排序，比向量匹配更准 |
 | 检索存储 | Milvus 2.5 Standalone（LlamaIndex 托管） | dense + BGE-M3 稀疏双路，RRF 融合，library_id 字段级库隔离 |
 | 关系库 | MySQL 8.0 + SQLAlchemy 2 + Alembic | 6 张表，迁移统一管理 |
-| 大模型 | DeepSeek（OpenAI 兼容协议，模型可切换） | 流式输出 + reasoning_content 思考过程 + usage |
+| 大模型 | DeepSeek（OpenAI 兼容协议，模型可切换） | 流式输出 + reasoning_content + function calling（自主检索）+ usage |
 | 部署 | Docker Compose（7 服务） | 一键启动，数据卷持久化，健康检查编排 |
 
 ---
@@ -302,7 +307,7 @@ open http://localhost                   # admin 登录 → 聊天页选"演示�
 **验收演示**（对运行中的服务）：
 
 ```bash
-python verify_contract.py           # 契约事件流验证（meta → tool_call? → reasoning/token → usage → done）
+python verify_contract.py           # 契约事件流验证（meta → reasoning/token → [tool_call → sources]? → usage → done）
 python test-data/e2e.py             # 端到端：登录→建库→上传→轮询就绪
 python test-data/chat.py            # chat 完整链路：登录→建会话→提问→读 SSE 事件
 ```
@@ -360,7 +365,7 @@ good-question/
 | 层 | 内容 | 说明 |
 |----|------|------|
 | 单元测试 | `backend/tests/` 54 个测试函数 | 安全 / 清洗 / 切片 / 文档服务 / embedding / 检索 / 聊天服务 / llama_store（含两级置信档边界、闲聊粗判与未命中固定话术分支），纯函数级，不依赖外部服务 |
-| 契约验证 | `verify_contract.py` | 运行时读真实 SSE 事件流，断言事件序（meta 首、usage 在 done 前）与字段完整（meta/tool_call/usage/reasoning/token/ts） |
+| 契约验证 | `verify_contract.py` | 运行时读真实 SSE 事件流，断言事件序（meta 首、usage 在 done 前）与字段完整（meta/tool_call/usage/reasoning/token/ts）；二期 tool_call 由 LLM 决策、可选 |
 | 迁移验证 | `test-data/e2e.py` / `chat.py` / `verify_old_data.py` | 登录→建库→上传→就绪 / chat 完整链路读 SSE / 旧数据重灌后检索验证 |
 | 前端构建 | `npm run build` | 改了前端代码必须先 build，否则 nginx 里是旧页面 |
 
