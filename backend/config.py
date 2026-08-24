@@ -21,7 +21,7 @@ class Settings(BaseSettings):
     # DeepSeek LLM
     deepseek_api_key: str = "sk-xxx"
     deepseek_base_url: str = "https://api.deepseek.com/v1"
-    deepseek_model: str = "deepseek-v4-pro"
+    deepseek_model: str = "deepseek-chat"
 
     # Embedding（默认与 .env.example 一致；换模型须保证向量维度与 Milvus collection 一致）
     embedding_model_name: str = "jinaai/jina-embeddings-v2-base-zh"

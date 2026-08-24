@@ -2,6 +2,7 @@
 import json
 import logging
 import time
+from functools import lru_cache
 
 import httpx
 from langchain_core.messages import AIMessage, HumanMessage
@@ -31,6 +32,12 @@ SYSTEM_PROMPT = """你是文档问答助手，基于提供的文档内容回答�
 2. 回答中可用 [来源N] 标注引用的文档片段
 3. 只有文档完全未涉及该问题时，才回答"文档中未找到相关信息"
 4. 不得编造文档中不存在的具体事实
+5. 若请求与文档无关（如问候、自我介绍、闲聊），且未检索到参考内容时，请自然礼貌地
+   说明你是文档问答助手、可解答文档库内问题，并邀请用户提问；不要编造"文档找到/查到"等表述。
+   注意：检索未命中不等于请求与文档无关——若问题是在询问文档内容（如查找条款、总结资料），
+   即使未检索到相关文档，也应走第 3 条如实回答"文档中未找到相关信息"，不得使用本条的问候话术。
+   打招呼场景可参考如下开场话术（可微调措辞，务必完整通顺）：
+   "你好，我是文档问答助手，可以基于文档库中的内容为你查找、总结或理解文档信息并解答相关问题。请问有什么可以帮你的吗？"
 
 对话历史摘要（早期对话已压缩，供参考）：
 {summary}
@@ -212,16 +219,59 @@ def _is_low_confidence(max_score: float | None) -> bool:
     )
 
 
+@lru_cache(maxsize=1)
+def _git_sha() -> str:
+    """尽力取当前 git commit sha（进程内缓存，仅首次 spawn 子进程；容器内可能无 .git）
+
+    每次 chat 请求都 spawn 一次 git 子进程不划算，commit 在进程生命周期内不变，
+    故用 lru_cache 缓存一次。
+    """
+    try:
+        import subprocess
+        return subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"], capture_output=True, text=True, timeout=2
+        ).stdout.strip()
+    except Exception:
+        return ""
+
+
+def _knowledge_version(library_id: int) -> str:
+    """知识库版本标识：取该会话所在文档库的最近上传时间（尽力），失败返回空串。
+
+    评测契约要求 knowledge_version 用于黄金答案时效校验；以库级最新文档时间为锚。
+    必须按 library_id 过滤：多库部署下取全局 max 会串库，知识版本标识失去意义。
+    """
+    try:
+        from models.document import Document
+        from sqlalchemy import func
+        db = SessionLocal()
+        try:
+            v = (
+                db.query(func.max(Document.created_at))
+                .filter(Document.library_id == library_id)
+                .scalar()
+            )
+            return v.strftime("%Y%m%d%H%M%S") if v else ""
+        finally:
+            db.close()
+    except Exception:
+        return ""
+
+
 def _stream_deepseek(messages: list[dict]):
     """直连 DeepSeek 流式调用，解析 reasoning_content 与 content
 
-    yield {"type": "reasoning"|"content", "content": str}
+    yield {"type": "reasoning"|"content"|"usage", ...}
+    - reasoning/content：增量文本
+    - usage：流末 usage chunk（include_usage 开启后返回，choices 为空），data 为 usage 对象
     """
     payload = {
         "model": settings.deepseek_model,
         "messages": messages,
         "stream": True,
         "temperature": 0.3,
+        # 评测契约要求透出真实 token 消耗；DeepSeek 流式默认不返回 usage，须显式开启
+        "stream_options": {"include_usage": True},
     }
     headers = {
         "Authorization": f"Bearer {settings.deepseek_api_key}",
@@ -241,7 +291,12 @@ def _stream_deepseek(messages: list[dict]):
             if raw == "[DONE]":
                 break
             try:
-                delta = json.loads(raw)["choices"][0]["delta"]
+                chunk = json.loads(raw)
+                # 流末 usage chunk：choices 为空但有 usage 字段（须在取 delta 前判断）
+                if chunk.get("usage"):
+                    yield {"type": "usage", "usage": chunk["usage"]}
+                    continue
+                delta = chunk["choices"][0]["delta"]
             except (json.JSONDecodeError, KeyError, IndexError):
                 continue
             if "reasoning_content" in delta and delta["reasoning_content"]:
@@ -256,7 +311,11 @@ def stream_chat(session_id: int, user_content: str):
     """SSE 生成器：yield (event_type, data_dict)
 
     使用独立 db session（避免请求 db 生命周期/跨请求状态问题）。
-    事件顺序：sources → token* → done（LLM 失败时 yield error）
+    事件顺序：meta → sources/tool_call → reasoning*/token* → usage → done（LLM 失败时 yield error）
+
+    评测契约（§5.1）对齐（路径 A：保留原有事件名，前端零改动）：
+    - 新增 meta / tool_call / usage 事件与全事件 ts 字段，供评测平台采集
+    - 平台侧 field_map 把 token→answer 映射，reasoning/token 的 data 兼容读 content 或 delta
     """
     db = SessionLocal()
     try:
@@ -265,6 +324,21 @@ def stream_chat(session_id: int, user_content: str):
         if session is None:
             yield ("error", {"message": "会话不存在"})
             return
+
+        def _ts() -> int:
+            """unix ms（评测契约要求，agent 侧生成）"""
+            return int(time.time() * 1000)
+
+        # 0. meta：环境快照（评测契约；模型名去前缀归一，git_sha 尽力取）
+        yield ("meta", {
+            "agent": "good-question",
+            "model": settings.deepseek_model,
+            "interface": "/api/chat",
+            "contract_version": "1.0",
+            "git_sha": _git_sha(),
+            "knowledge_version": _knowledge_version(session.library_id),
+            "ts": _ts(),
+        })
 
         # 1. 混合检索（dense + BM25 → RRF 融合 → rerank）
         retriever = HybridRetriever(library_id=session.library_id)
@@ -279,7 +353,7 @@ def stream_chat(session_id: int, user_content: str):
             "无" if max_score is None else round(max_score, 3), low_confidence,
         )
 
-        # 2. 仅在检索到结果时推送 sources（无结果时不展示空引用来源）
+        # 2. 仅在检索到结果时推送 sources + tool_call（无结果时不展示空引用来源）
         sources = []
         if docs:
             sources = [
@@ -292,25 +366,42 @@ def stream_chat(session_id: int, user_content: str):
                 }
                 for d in docs
             ]
-            yield ("sources", {"sources": sources})
+            # 检索外显为标准 tool_call（评测契约；sources 保留给前端）
+            yield ("tool_call", {
+                "id": f"retrieve-{_ts()}",
+                "name": "hybrid_retrieve",
+                "args": {"query": user_content},
+                "result": {"source_count": len(docs), "sources": sources},
+                "status": "ok",
+                "ts": _ts(),
+            })
+            yield ("sources", {"sources": sources, "ts": _ts()})
         logger.info("[chat] 检索完成 耗时=%.2fs 结果=%s，开始 LLM 流式", time.time() - t_start, len(docs))
 
         # 3. 构建上下文
         summary, history = _build_context(db, session)
         context = _format_docs(docs)
+        if not docs:
+            # 未检索到任何参考内容：显式告知 LLM，避免空 context 下幻觉"文档找到"
+            context = "（本次未检索到相关文档内容）"
 
-        # 4. 流式调用 DeepSeek（解析 reasoning_content 思考过程 + content 回答）
+        # 4. 流式调用 DeepSeek（解析 reasoning_content 思考过程 + content 回答 + usage）
         messages = _build_messages(summary, history, context, user_content, low_confidence=low_confidence)
         full_answer = ""
         full_reasoning = ""
+        usage: dict | None = None
         try:
             for ev in _stream_deepseek(messages):
-                if ev["type"] == "reasoning":
+                if ev["type"] == "usage":
+                    # 透传真实 token 消耗（评测契约必选字段）
+                    usage = ev["usage"]
+                    yield ("usage", {**ev["usage"], "ts": _ts()})
+                elif ev["type"] == "reasoning":
                     full_reasoning += ev["content"]
-                    yield ("reasoning", {"content": ev["content"]})
+                    yield ("reasoning", {"content": ev["content"], "delta": ev["content"], "ts": _ts()})
                 else:
                     full_answer += ev["content"]
-                    yield ("token", {"content": ev["content"]})
+                    yield ("token", {"content": ev["content"], "delta": ev["content"], "ts": _ts()})
         except Exception as e:
             logger.error("[chat] LLM 流式失败: %s", e)
             yield ("error", {"message": "LLM 调用失败，请稍后重试"})
@@ -321,7 +412,7 @@ def stream_chat(session_id: int, user_content: str):
         _compress_memory(db, session)
 
         # 6. done
-        yield ("done", {"message_id": assistant_id})
+        yield ("done", {"message_id": assistant_id, "ts": _ts()})
     finally:
         db.close()
 

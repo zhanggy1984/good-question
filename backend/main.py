@@ -87,6 +87,7 @@ async def validation_error_handler(request: Request, exc: RequestValidationError
 # 注册 API 路由
 from api import auth as auth_api  # noqa: E402
 from api import chat as chat_api  # noqa: E402
+from api import contracts as contracts_api  # noqa: E402
 from api import dashboard as dashboard_api  # noqa: E402
 from api import document as document_api  # noqa: E402
 from api import library as library_api  # noqa: E402
@@ -98,6 +99,7 @@ app.include_router(library_api.router, prefix="/api/libraries", tags=["libraries
 app.include_router(document_api.router, prefix="/api", tags=["documents"])
 app.include_router(session_api.router, prefix="/api/sessions", tags=["sessions"])
 app.include_router(chat_api.router, prefix="/api", tags=["chat"])
+app.include_router(contracts_api.router, prefix="/api", tags=["contracts"])
 
 
 @app.get("/api/health")
