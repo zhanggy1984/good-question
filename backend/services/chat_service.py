@@ -1,6 +1,7 @@
 """聊天业务逻辑：会话管理 + RAG 链 + 对话记忆压缩 + SSE 流式生成"""
 import json
 import logging
+import re
 import time
 from functools import lru_cache
 
@@ -58,25 +59,104 @@ _NOT_FOUND_ANSWER = (
     "您可以换个问法再试，或确认该问题是否属于文档库涵盖的范围。"
 )
 
-# 闲聊/问候粗判关键词（仅用于 docs 空时区分"引导话术"与"如实未找到"）
-_SMALLTALK_KEYWORDS = (
-    "你好", "您好", "嗨", "哈喽", "嗨喽", "hello", "hi",
-    "自我介绍", "你是谁", "你能做什么", "你是干嘛的", "谢谢", "再见",
+# 意图无法识别（unknown）的澄清话术：区别于 query 的"未找到"——unknown 不是"没检索到答案"
+# 而是"没听懂意图"，措辞引导澄清而非断言文档无此内容。同样不调 LLM、不编造（防幻觉不变）。
+_UNKNOWN_ANSWER = (
+    "抱歉，我还没完全理解您的问题。"
+    "请换个说法，或告诉我您想了解文档库中哪方面的信息。"
 )
-# 查询意图词：命中即判非闲聊（避免"你好，工资几号发"这类带问候前缀的查询被误判为闲聊）
-_QUERY_INTENT_KEYWORDS = ("？", "?", "什么", "几", "多少", "怎么", "如何", "为什么", "查询", "查找", "帮")
+
+# 轻量规则意图分类词表（仅用于 docs 空时区分"引导话术"与"如实未找到"）
+# 身份类闲聊：最特定（"你是谁/你能做什么"），即便含疑问词也判闲聊——优先于查询意图
+_IDENTITY_SMALLTALK = (
+    "你是谁", "你叫什么", "你能做什么", "你会什么", "你是什么", "你是干嘛的",
+    "自我介绍", "介绍一下你自己", "介绍下你自己",
+)
+# 查询意图标记：疑问词 / 疑问号 / 查询动词。命中判查询——防编造的最关键闸门
+# （query 优先于一般闲聊：带问候前缀的查询如"你好，工资几号发"必须判查询，
+#   绝不能交给 LLM 在空 context 下编造）
+_QUERY_MARKERS = (
+    "？", "?", "什么", "怎么", "如何", "为什么", "几", "多少", "哪些", "何时",
+    "哪里", "是不是", "能否", "可以吗", "有没有", "是否", "查", "找", "帮",
+    "告诉", "解释", "总结", "说明", "写", "列出", "推荐",
+    # 领域词（演示文档场景）与口语疑问词：减少冷门话术滑向 unknown
+    "到账", "发放", "报销", "请假", "安装", "部署", "命令", "配置",
+    "多久", "几天", "啥时候", "咋",
+)
+# 寒暄整句（正则 fullmatch）：覆盖"最近/今天 + 心情/状态/过得 + 怎么样/咋样"等口语变体，
+# 含"怎么/咋"但整句是寒暄则非查询。优先级放在 query 之前——关键约束是 fullmatch 整句：
+# "今天心情怎么样，工资几号发"（带查询）不命中 → 继续走 query。
+# 原固定短语清单（"最近怎么样/今天怎么样/最近在忙什么/吃了没/干嘛呢/忙不忙"）全部被下列模式覆盖。
+_CASUAL_PATTERNS = (
+    # 人称前缀可选：覆盖"你最近怎么样/您最近咋样"（人称在时间词前）与无人称"最近怎么样"
+    re.compile(r"^(你|您)?(最近|今天|这两天|这段时间)(心情|状态|过得|身体)?怎么样[啊呀呢嘛!！？?\s]*$"),
+    re.compile(r"^(你|您)?(最近|今天|这两天|这段时间)(心情|状态|过得|身体)?咋样[啊呀呢嘛!！？?\s]*$"),
+    re.compile(r"^(最近|这两天)?(在)?忙(什么|不忙)[啊呀呢嘛!！？?\s]*$"),
+    re.compile(r"^(你|您)(现在)?(在)?(干嘛|干啥|忙什么|做什么|咋了|怎么了)呢?[啊呀?！?\s]*$"),
+    re.compile(r"^你呢?[啊呀?！?\s]*$"),
+    re.compile(r"^吃了(没|吗)[啊呀?！?\s]*$"),
+)
+# 明确回指词：unknown 时仅命中这些才回看 history 归队（"就这个/还有呢"延续上一轮意图）。
+# 收紧条件避免跨话题短词（如"你呢"）被归错队——"你呢"已是闲聊反问，由 _CASUAL_PATTERNS 直接识别。
+_REFERENTIAL_WORDS = (
+    "就这个", "还有呢", "然后呢", "再说说", "再详细点", "这个呢", "那个呢",
+)
+# 一般闲聊：问候 / 感谢 / 道别。仅当无查询意图时才判闲聊
+_SOCIAL_SMALLTALK = (
+    "你好", "您好", "嗨", "哈喽", "嗨喽", "hello", "hi", "在吗", "在不在",
+    "早上好", "中午好", "下午好", "晚上好",
+    "谢谢", "感谢", "辛苦你了", "谢谢你",
+    "再见", "拜拜", "回头聊", "下次聊",
+)
 
 
-def _is_smalltalk(text: str) -> bool:
-    """粗判问候/闲聊意图：docs 空时闲聊走 LLM 引导话术，事实查询走固定"未找到"话术
+def _classify_intent(text: str, history: list | None = None) -> str:
+    """轻量规则意图分类：smalltalk / query / unknown（docs 空时决定走 LLM 还是固定话术）
 
-    先排除明确查询意图（含疑问词/查询动词即便带问候前缀也算查询），再查问候关键词。
+    优先级：身份闲聊 > 寒暄整句 > 查询意图 > 一般闲聊 > unknown（回看历史最近一条 user）。
+    - 身份闲聊最特定，即便含疑问词（"你能做什么"）也判闲聊，走 LLM 引导话术；
+    - 寒暄整句（"最近怎么样/今天心情怎么样"）含"怎么"但整句匹配、非查询，优先于 query；
+    - 查询意图优先于一般闲聊：带问候前缀的查询（"你好，工资几号发"）必须判查询，
+      避免交给 LLM 在空 context 下编造；
+    - unknown（既非闲聊也非明确查询）保守判非闲聊 → 走澄清话术（同样不调 LLM，防编造）；
+      history 可选：unknown 且命中明确回指词（"就这个/还有呢"）时回看最近一条 user 消息
+      的意图归队延续上一轮；"你呢"等闲聊反问已由 _CASUAL_PATTERNS 直接识别，不靠 history
+      归队（避免跨话题短词被归错队）。
     抽成纯函数便于单元测试覆盖边界（见 tests/test_chat_service.py）。
     """
     t = text.lower().strip()
-    if any(q in t for q in _QUERY_INTENT_KEYWORDS):
-        return False
-    return any(k in t for k in _SMALLTALK_KEYWORDS)
+    if not t:
+        return "unknown"
+    if any(k in t for k in _IDENTITY_SMALLTALK):
+        return "smalltalk"
+    if any(p.fullmatch(t) for p in _CASUAL_PATTERNS):
+        return "smalltalk"
+    if any(q in t for q in _QUERY_MARKERS):
+        return "query"
+    if any(k in t for k in _SOCIAL_SMALLTALK):
+        return "smalltalk"
+    if history and any(w in t for w in _REFERENTIAL_WORDS):
+        prev = _last_user_intent(history, current_text=t)
+        if prev in ("smalltalk", "query"):
+            return prev
+    return "unknown"
+
+
+def _last_user_intent(history: list, current_text: str) -> str | None:
+    """回看最近一条 user 消息的意图（跳过当前问题本身），供 unknown 回指延续"""
+    for msg in reversed(history):
+        if getattr(msg, "type", None) != "human":
+            continue
+        prev = (getattr(msg, "content", "") or "").strip().lower()
+        if not prev or prev == current_text:
+            continue
+        return _classify_intent(prev)
+    return None
+
+
+def _is_smalltalk(text: str, history: list | None = None) -> bool:
+    """是否闲聊意图（_classify_intent 的布尔化，兼容调用点与旧测试）"""
+    return _classify_intent(text, history) == "smalltalk"
 
 
 # ════════ 会话 CRUD ════════
@@ -401,9 +481,12 @@ def stream_chat(session_id: int, user_content: str):
             context = "（本次未检索到相关文档内容）"
             # 防幻觉加固：事实类查询未命中直接走固定话术，不交给 LLM——实测空 context 下
             # DeepSeek 会稳定编造"合理答案"（如编造工资发放日为每月 10 号）。仅闲聊类请求
-            # 继续走 LLM（SYSTEM_PROMPT 有专门的引导话术）。
-            if not _is_smalltalk(user_content):
-                answer = _NOT_FOUND_ANSWER
+            # 继续走 LLM（SYSTEM_PROMPT 有专门的引导话术）。意图分类分三路：
+            # query → 如实"未找到"；unknown（无法确定意图）→ 澄清引导（同样不调 LLM，
+            #   防编造不变，但措辞是"没听懂"而非"没找到"）；smalltalk → 走 LLM 引导话术。
+            intent = _classify_intent(user_content, history)
+            if intent != "smalltalk":
+                answer = _NOT_FOUND_ANSWER if intent == "query" else _UNKNOWN_ANSWER
                 yield ("token", {"content": answer, "delta": answer, "ts": _ts()})
                 # 未调 LLM 无真实 token 消耗，合成 0 计数对齐评测契约（usage 必须在 done 前）
                 yield ("usage", {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "ts": _ts()})

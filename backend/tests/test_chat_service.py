@@ -16,6 +16,7 @@ from config import settings
 from services.chat_service import (
     LOW_CONFIDENCE_HINT,
     _build_messages,
+    _classify_intent,
     _is_low_confidence,
     _is_smalltalk,
 )
@@ -59,18 +60,64 @@ def test_is_low_confidence_boundaries():
 
 
 def test_is_smalltalk_boundaries():
-    """闲聊粗判边界：纯问候/纯闲聊判 True；含查询意图（即便带问候前缀）判 False"""
+    """闲聊粗判边界：纯问候/纯闲聊判 True；含查询意图（即便带问候前缀/感谢尾缀）判 False"""
     assert _is_smalltalk("你好") is True
     assert _is_smalltalk("您好，请问在吗") is True
     assert _is_smalltalk("hi") is True
     assert _is_smalltalk("你是谁") is True
+    assert _is_smalltalk("你能做什么") is True          # 身份闲聊含"什么"仍判闲聊
+    assert _is_smalltalk("在吗") is True
     assert _is_smalltalk("谢谢") is True
     assert _is_smalltalk("工资发放日是几号") is False
     assert _is_smalltalk("你好，工资发放日是几号") is False  # 带问候前缀的查询仍判非闲聊
+    assert _is_smalltalk("工资是几号发，谢谢") is False      # 带感谢尾缀的查询仍判非闲聊
     assert _is_smalltalk("请事假怎么请") is False
     assert _is_smalltalk("帮我总结一下") is False
+    assert _is_smalltalk("今天心情怎么样") is True   # 口语寒暄整句（问题2修复：含"怎么"仍判闲聊）
+    assert _is_smalltalk("这钱啥时候到账") is False  # 领域词/口语疑问词判查询（问题1修复：不滑向 unknown）
     assert _is_smalltalk("") is False
     assert _is_smalltalk("   ") is False
+
+
+def test_classify_intent_three_way():
+    """规则意图分类三档：smalltalk（身份/问候/寒暄）｜query（疑问/查询动词）｜unknown（无法识别）"""
+    assert _classify_intent("你是谁") == "smalltalk"         # 身份闲聊优先于疑问词
+    assert _classify_intent("你能做什么") == "smalltalk"     # 含"什么"但身份闲聊
+    assert _classify_intent("你好") == "smalltalk"
+    assert _classify_intent("在吗") == "smalltalk"
+    assert _classify_intent("最近怎么样") == "smalltalk"
+    assert _classify_intent("今天心情怎么样") == "smalltalk"  # 口语寒暄变体（整句正则命中"怎么"不误伤）
+    assert _classify_intent("最近咋样") == "smalltalk"        # 口语"咋"变体
+    assert _classify_intent("你最近咋样") == "smalltalk"      # 人称前缀在时间词前（挑战1修复）
+    assert _classify_intent("你咋了") == "smalltalk"          # 口语闲聊 vs 疑问词"咋"
+    assert _classify_intent("你呢") == "smalltalk"            # 闲聊反问，直接识别不靠 history
+    assert _classify_intent("谢谢") == "smalltalk"
+    assert _classify_intent("你好，工资发放日是几号") == "query"  # 问候前缀不覆盖查询
+    assert _classify_intent("工资是几号发，谢谢") == "query"       # 感谢尾缀不覆盖查询
+    assert _classify_intent("今天心情怎么样，工资几号发") == "query"  # 寒暄+查询整句不误伤
+    assert _classify_intent("Docker 的常用命令有哪些") == "query"
+    assert _classify_intent("这钱啥时候到账") == "query"       # 领域词/口语疑问词防滑向 unknown
+    assert _classify_intent("帮我总结一下") == "query"
+    assert _classify_intent("Docker") == "unknown"          # 无闲聊词也无查询标记
+    assert _classify_intent("") == "unknown"
+
+
+def test_classify_intent_history_fallback():
+    """unknown 且命中明确回指词才回看 history 归队；非回指 unknown 不归队（挑战2收紧）"""
+    from types import SimpleNamespace
+    def human(t): return SimpleNamespace(type="human", content=t)
+    # 回指词 + 前一轮事实查询 → 归队 query（延续追问）
+    assert _classify_intent("就这个", history=[human("工资发放日是几号")]) == "query"
+    # 回指词 + 前一轮闲聊 → 归队 smalltalk（延续寒暄）
+    assert _classify_intent("还有呢", history=[human("最近怎么样")]) == "smalltalk"
+    # 无 history 时 unknown 保持 unknown（不归队）
+    assert _classify_intent("就这个") == "unknown"
+    # 非回指词 unknown 不归队（"天气"不是回指词，前一轮是 query 也不归队）
+    assert _classify_intent("天气", history=[human("工资发放日是几号")]) == "unknown"
+    # "你呢"是闲聊反问，直接识别为 smalltalk（跨话题不归队到 query，挑战2核心）
+    assert _classify_intent("你呢", history=[human("工资发放日是几号")]) == "smalltalk"
+    # 当前句本身有明确查询意图，history 不覆盖明确分类
+    assert _classify_intent("工资几号发", history=[human("最近怎么样")]) == "query"
 
 
 # ════════ 评测契约逻辑测试（2.0 契约改造）════════
@@ -304,3 +351,28 @@ def test_contracts_manifest_endpoint():
     assert chat_iface["llm"] is True
     tags = {s["tag"] for s in data["scenes"]}
     assert {"greeting", "doc_qa", "no_hit", "summarize"} <= tags
+
+
+def test_stream_chat_no_docs_unknown_uses_clarify_answer(monkeypatch):
+    """意图无法识别（unknown）未命中：走澄清话术而非"未找到"，仍不调 LLM（问题1修复）
+
+    unknown ≠ query：未知意图用"没理解，请澄清"措辞引导，而不是断言"文档未找到"；
+    与 query 一样不调 LLM（防编造不变），usage 合成 0。
+    """
+    calls = {"stream": 0}
+
+    def _fake_stream(messages):
+        calls["stream"] += 1
+        raise AssertionError("unknown 未命中不应调用 LLM")
+
+    _patch_chat_pipeline(monkeypatch)
+    monkeypatch.setattr(cs, "_stream_deepseek", _fake_stream)
+
+    events = list(cs.stream_chat(1, "Docker"))  # 无闲聊词也无查询标记 → unknown
+    assert calls["stream"] == 0, "unknown 未命中不应调用 LLM"
+
+    tok = next(d for t, d in events if t == "token")
+    assert tok["content"] == cs._UNKNOWN_ANSWER
+    assert tok["content"] != cs._NOT_FOUND_ANSWER
+    usage = next(d for t, d in events if t == "usage")
+    assert usage["total_tokens"] == 0

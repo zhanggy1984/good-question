@@ -21,7 +21,7 @@ MANIFEST = {
     "scenes": [
         {"tag": "greeting", "description": "问候与闲聊"},
         {"tag": "doc_qa", "description": "文档检索问答"},
-        {"tag": "no_hit", "description": "无命中兜底"},
+        {"tag": "no_hit", "description": "无命中/意图不明兜底（不调 LLM，如实回复或引导澄清）"},
         {"tag": "summarize", "description": "文档内容总结"},
     ],
 }
