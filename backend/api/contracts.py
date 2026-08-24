@@ -14,14 +14,14 @@ MANIFEST = {
     "interfaces": [
         {"name": "chat", "path": "/api/chat/{session_id}", "method": "POST",
          "contract_type": "sse", "llm": True,
-         "description": "知识问答（SSE 流式，token 事件经 field_map 映射 answer）"},
+         "description": "知识问答（SSE 流式，LLM 自主决定是否检索，检索经 tool_call/sources 事件回传；token 事件经 field_map 映射 answer）"},
         {"name": "login", "path": "/api/auth/login", "method": "POST",
          "llm": False, "description": "会话鉴权（辅助接口）"},
     ],
     "scenes": [
         {"tag": "greeting", "description": "问候与闲聊"},
         {"tag": "doc_qa", "description": "文档检索问答"},
-        {"tag": "no_hit", "description": "无命中/意图不明兜底（不调 LLM，如实回复或引导澄清）"},
+        {"tag": "no_hit", "description": "无命中/意图不明兜底（检索空时如实回复或引导澄清）"},
         {"tag": "summarize", "description": "文档内容总结"},
     ],
 }

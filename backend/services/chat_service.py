@@ -24,33 +24,44 @@ MAX_MESSAGES_BEFORE_COMPRESS = 20  # >10 轮（20 条）触发压缩
 KEEP_RECENT_MESSAGES = 6           # 保留最近 3 轮（6 条）
 TITLE_MAX_CHARS = 30
 
-SYSTEM_PROMPT = """你是文档问答助手，基于提供的文档内容回答问题。
+# 二期 function calling：检索由 LLM 自主决定。system prompt 无 {context} 占位符——
+# 检索结果由工具执行器经 tool 消息回传，模型基于 tool 结果作答（见 stream_chat agent loop）。
+SYSTEM_PROMPT = """你是「好问」文档问答助手，基于文档库内容回答问题。
 
-回答要求：
-1. 依据提供的文档内容回答，可从文档合理推断和总结，不必逐字照搬
-2. 回答中可用 [来源N] 标注引用的文档片段
-3. 只有文档完全未涉及该问题时，才回答"文档中未找到相关信息"
-4. 不得编造文档中不存在的具体事实
-5. 若请求与文档无关（如问候、自我介绍、闲聊），且未检索到参考内容时，请自然礼貌地
-   说明你是文档问答助手、可解答文档库内问题，并邀请用户提问；不要编造"文档找到/查到"等表述。
-   注意：检索未命中不等于请求与文档无关——若问题是在询问文档内容（如查找条款、总结资料），
-   即使未检索到相关文档，也应走第 3 条如实回答"文档中未找到相关信息"，不得使用本条的问候话术。
-   打招呼场景可参考如下开场话术（可微调措辞，务必完整通顺）：
-   "你好，我是文档问答助手，可以基于文档库中的内容为你查找、总结或理解文档信息并解答相关问题。请问有什么可以帮你的吗？"
+工具使用规则：
+1. 用户询问文档库中的事实/信息/规则/流程，或要求总结文档内容时，必须先调用 hybrid_retrieve 工具检索相关资料。
+2. 仅问候、寒暄、自我介绍等与文档无关的对话可直接回答，不调用工具。
+3. 收到检索结果后严格基于结果内容回答，可用 [来源N] 标注引用片段；不得编造结果中不存在的事实。
+4. 检索结果为空时，如实回答“文档中未找到相关信息”，不要编造“找到”或具体事实。
+5. 若检索结果标注低置信，说明相关性存疑；不足以支撑回答时如实说明，不要勉强作答。
 
 对话历史摘要（早期对话已压缩，供参考）：
-{summary}
+{summary}"""
 
-参考资料（带来源编号）：
-{context}"""
+# hybrid_retrieve 工具定义（DeepSeek function calling 用）；query 由 LLM 自主生成
+RETRIEVE_TOOL_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "hybrid_retrieve",
+        "description": (
+            "在文档库中检索与用户问题相关的资料。"
+            "用户询问文档库中的事实、规则、流程、条款，或要求总结文档内容时，必须先调用本工具。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "用于检索的查询词，通常是用户问题的原文或核心关键词",
+                },
+            },
+            "required": ["query"],
+        },
+    },
+}
 
-# 低置信兜底提示：检索到内容但相关性存疑时追加到 system prompt，
-# 让 LLM 不基于边缘相关片段勉强作答/编造（见 stream_chat 的 low_confidence 分支）
-LOW_CONFIDENCE_HINT = (
-    "\n\n注意：本次检索到的资料与问题相关性不确定。"
-    "若这些资料不足以支撑回答，请直接回答“文档中未找到相关信息”，"
-    "不要基于相关性存疑的资料勉强作答，更不要编造。"
-)
+# agent loop 循环上限：第一轮带 tools 判断是否检索，命中后第二轮作答不再传 tools（防再循环）
+MAX_TOOL_ROUNDS = 2
 
 # 未命中固定话术：事实类查询在 docs 空时不调 LLM（实测空 context 下 DeepSeek 稳定编造
 # "合理答案"，如编造工资发放日为 10 号），直接如实回答；闲聊类请求才交给 LLM 走引导话术
@@ -286,13 +297,14 @@ def _format_docs(docs) -> str:
     return "\n\n---\n\n".join(parts)
 
 
-def _build_messages(
-    summary: str, history: list, context: str, question: str, low_confidence: bool = False
-) -> list[dict]:
-    """构建 DeepSeek API 的 messages（system + history + human）；低置信档追加兜底提示"""
-    system = SYSTEM_PROMPT.format(summary=summary, context=context)
-    if low_confidence:
-        system += LOW_CONFIDENCE_HINT
+def _build_messages(summary: str, history: list, question: str) -> list[dict]:
+    """构建 DeepSeek API 的 messages（system + history + 末尾 user 问题）
+
+    二期 function calling：system prompt 不含检索 context（由 hybrid_retrieve 的
+    tool 结果经 tool 消息回传），第一轮与第二轮都以此骨架起步，第二轮再追加
+    assistant(tool_calls) + tool 消息。
+    """
+    system = SYSTEM_PROMPT.format(summary=summary)
     messages = [{"role": "system", "content": system}]
     for m in history:
         role = "user" if m.type == "human" else "assistant"
@@ -353,11 +365,26 @@ def _knowledge_version(library_id: int) -> str:
         return ""
 
 
-def _stream_deepseek(messages: list[dict]):
-    """直连 DeepSeek 流式调用，解析 reasoning_content 与 content
+def _tool_call_event(tool_acc: dict) -> dict:
+    """把按 index 累积的 tool_calls 组装成 yield 事件（arguments 保持 JSON 字符串，不 parse）"""
+    calls = [
+        {
+            "id": item["id"],
+            "type": "function",
+            "function": {"name": item["name"], "arguments": item["arguments"]},
+        }
+        for item in tool_acc.values()
+    ]
+    return {"type": "tool_call", "tool_calls": calls}
 
-    yield {"type": "reasoning"|"content"|"usage", ...}
+
+def _stream_deepseek(messages: list[dict], tools: list[dict] | None = None):
+    """直连 DeepSeek 流式调用，解析 reasoning_content / content / tool_calls / usage
+
+    yield {"type": "reasoning"|"content"|"tool_call"|"usage", ...}
     - reasoning/content：增量文本
+    - tool_call：LLM 决定调用工具时（finish_reason=="tool_calls"）一次性 flush 完整参数
+      （tool_calls 按 delta 分片按 index 累加，arguments 为 JSON 字符串）
     - usage：流末 usage chunk（include_usage 开启后返回，choices 为空），data 为 usage 对象
     """
     payload = {
@@ -368,6 +395,8 @@ def _stream_deepseek(messages: list[dict]):
         # 评测契约要求透出真实 token 消耗；DeepSeek 流式默认不返回 usage，须显式开启
         "stream_options": {"include_usage": True},
     }
+    if tools:
+        payload["tools"] = tools  # 不设 tool_choice，默认 auto，由 LLM 自主决定
     headers = {
         "Authorization": f"Bearer {settings.deepseek_api_key}",
         "Content-Type": "application/json",
@@ -379,6 +408,7 @@ def _stream_deepseek(messages: list[dict]):
         headers=headers,
         timeout=120,
     ) as resp:
+        tool_acc: dict = {}  # index -> {"id", "name", "arguments"}；arguments 增量拼接
         for line in resp.iter_lines():
             if not line or not line.startswith("data:"):
                 continue
@@ -391,13 +421,86 @@ def _stream_deepseek(messages: list[dict]):
                 if chunk.get("usage"):
                     yield {"type": "usage", "usage": chunk["usage"]}
                     continue
-                delta = chunk["choices"][0]["delta"]
+                choice = chunk["choices"][0]
+                delta = choice["delta"]
+                finish_reason = choice.get("finish_reason")
             except (json.JSONDecodeError, KeyError, IndexError):
                 continue
+            # tool_calls 按 index 分片累加（id/name 首个分片携带，arguments 增量拼接）
+            if "tool_calls" in delta:
+                for tc in delta.get("tool_calls", []):
+                    item = tool_acc.setdefault(
+                        tc.get("index", 0), {"id": "", "name": "", "arguments": ""}
+                    )
+                    if tc.get("id"):
+                        item["id"] = tc["id"]
+                    fn = tc.get("function") or {}
+                    if fn.get("name"):
+                        item["name"] = fn["name"]
+                    if fn.get("arguments"):
+                        item["arguments"] += fn["arguments"]
             if "reasoning_content" in delta and delta["reasoning_content"]:
                 yield {"type": "reasoning", "content": delta["reasoning_content"]}
             if "content" in delta and delta["content"]:
                 yield {"type": "content", "content": delta["content"]}
+            # 结束信号：finish_reason=="tool_calls" 的 chunk 通常带着最后一个 tool_calls
+            # 分片（须先累积再 flush，保证参数完整）
+            if finish_reason == "tool_calls" and tool_acc:
+                yield _tool_call_event(tool_acc)
+                tool_acc = {}
+        # [DONE] 兜底：个别实现不返回 finish_reason 也能累积到 tool_calls
+        if tool_acc:
+            yield _tool_call_event(tool_acc)
+
+
+# ════════ 二期 function calling 支撑 ════════
+
+def _ts() -> int:
+    """unix ms（评测契约要求，agent 侧生成）"""
+    return int(time.time() * 1000)
+
+
+def _json_log(kind: str, **fields) -> None:
+    """结构化 JSON 日志：tool 决策与请求汇总各打一行 JSON，供请求分析监控采集"""
+    logger.info(json.dumps({"ts": _ts(), "kind": kind, **fields}, ensure_ascii=False))
+
+
+def _confidence_band(max_score: float | None) -> str:
+    """检索置信档三档：none（无分/低于 LOW 视为无关）｜low（[LOW, 低置信阈值) 相关性存疑）｜high"""
+    if max_score is None or max_score < settings.similarity_threshold_low:
+        return "none"
+    if max_score < settings.rerank_low_confidence_threshold:
+        return "low"
+    return "high"
+
+
+def _execute_retrieve_tool(library_id: int, query: str) -> dict:
+    """执行 hybrid_retrieve 工具：检索 + 组装 LLM 上下文与 SSE sources
+
+    返回 dict：context（[来源N] 格式化，供第二轮 LLM 的 tool 消息）、sources（前端引用卡片）、
+    source_count / max_score / confidence_band（tool_call 事件 result 与监控日志用）
+    """
+    retriever = HybridRetriever(library_id=library_id)
+    chunks = retriever.invoke(query)
+    max_score = retriever.max_rerank_score
+    sources = [
+        {
+            "document_name": c.metadata.get("document_name", "未知文档"),
+            "heading_path": [h for h in (c.metadata.get("heading_path") or []) if h],
+            "chunk_content": c.content[:200],
+            "chunk_index": c.metadata.get("chunk_index"),
+            "total_chunks": c.metadata.get("total_chunks"),
+        }
+        for c in chunks
+    ]
+    return {
+        "context": _format_docs(chunks),
+        "sources": sources,
+        "source_count": len(chunks),
+        # rerank 返回 numpy float32，进 SSE tool_call result 与 JSON 日志须转原生 float（json.dumps 不认 float32）
+        "max_score": float(max_score) if max_score is not None else None,
+        "confidence_band": _confidence_band(max_score),
+    }
 
 
 # ════════ 流式聊天 ════════
@@ -405,11 +508,18 @@ def _stream_deepseek(messages: list[dict]):
 def stream_chat(session_id: int, user_content: str):
     """SSE 生成器：yield (event_type, data_dict)
 
-    使用独立 db session（避免请求 db 生命周期/跨请求状态问题）。
-    事件顺序：meta → sources/tool_call → reasoning*/token* → usage → done（LLM 失败时 yield error）
+    二期 function calling 编排：LLM 第一轮带 hybrid_retrieve 工具自主决定是否检索，
+    命中则经 tool 消息回传结果、第二轮作答；检索空走规则三路兜底（防幻觉）。
 
-    评测契约（§5.1）对齐（路径 A：保留原有事件名，前端零改动）：
-    - 新增 meta / tool_call / usage 事件与全事件 ts 字段，供评测平台采集
+    使用独立 db session（避免请求 db 生命周期/跨请求状态问题）。
+    事件顺序（二期）：
+      - 不检索：meta → reasoning*/token* → usage → done
+      - 检索命中：meta → reasoning* → tool_call → sources → reasoning*/token* → usage → done
+      - 检索空 + query/unknown：meta → reasoning* → tool_call → token(固定话术) → usage → done
+    LLM 失败时 yield error。
+
+    评测契约（§5.1）对齐（保留事件名，前端零改动）：
+    - meta / tool_call / usage 事件与全事件 ts 字段，供评测平台采集
     - 平台侧 field_map 把 token→answer 映射，reasoning/token 的 data 兼容读 content 或 delta
     """
     db = SessionLocal()
@@ -419,10 +529,6 @@ def stream_chat(session_id: int, user_content: str):
         if session is None:
             yield ("error", {"message": "会话不存在"})
             return
-
-        def _ts() -> int:
-            """unix ms（评测契约要求，agent 侧生成）"""
-            return int(time.time() * 1000)
 
         # 0. meta：环境快照（评测契约；模型名去前缀归一，git_sha 尽力取）
         yield ("meta", {
@@ -435,91 +541,160 @@ def stream_chat(session_id: int, user_content: str):
             "ts": _ts(),
         })
 
-        # 1. 混合检索（dense + 稀疏 → RRF 融合 → rerank）
-        retriever = HybridRetriever(library_id=session.library_id)
-        docs = retriever.invoke(user_content)
-
-        # 两级置信档：最高分 < LOW 判"文档无关"返回空；落在 [LOW, 低置信阈值) 判"相关性存疑"，
-        # 检索结果照常保留（不误杀），但提示 LLM 相关性存疑、不足以回答则如实说未找到
-        max_score = retriever.max_rerank_score
-        low_confidence = _is_low_confidence(max_score)
-        logger.info(
-            "[chat] 检索置信档 max_score=%s low_confidence=%s",
-            "无" if max_score is None else round(max_score, 3), low_confidence,
-        )
-
-        # 2. 仅在检索到结果时推送 sources + tool_call（无结果时不展示空引用来源）
-        sources = []
-        if docs:
-            sources = [
-                {
-                    "document_name": d.metadata.get("document_name", "未知文档"),
-                    "heading_path": [h for h in (d.metadata.get("heading_path") or []) if h],
-                    "chunk_content": d.content[:200],
-                    "chunk_index": d.metadata.get("chunk_index"),
-                    "total_chunks": d.metadata.get("total_chunks"),
-                }
-                for d in docs
-            ]
-            # 检索外显为标准 tool_call（评测契约；sources 保留给前端）
-            yield ("tool_call", {
-                "id": f"retrieve-{_ts()}",
-                "name": "hybrid_retrieve",
-                "args": {"query": user_content},
-                "result": {"source_count": len(docs), "sources": sources},
-                "status": "ok",
-                "ts": _ts(),
-            })
-            yield ("sources", {"sources": sources, "ts": _ts()})
-        logger.info("[chat] 检索完成 耗时=%.2fs 结果=%s，开始 LLM 流式", time.time() - t_start, len(docs))
-
-        # 3. 构建上下文
         summary, history = _build_context(db, session)
-        context = _format_docs(docs)
-        if not docs:
-            # 未检索到任何参考内容：显式告知 LLM，避免空 context 下幻觉"文档找到"
-            context = "（本次未检索到相关文档内容）"
-            # 防幻觉加固：事实类查询未命中直接走固定话术，不交给 LLM——实测空 context 下
-            # DeepSeek 会稳定编造"合理答案"（如编造工资发放日为每月 10 号）。仅闲聊类请求
-            # 继续走 LLM（SYSTEM_PROMPT 有专门的引导话术）。意图分类分三路：
-            # query → 如实"未找到"；unknown（无法确定意图）→ 澄清引导（同样不调 LLM，
-            #   防编造不变，但措辞是"没听懂"而非"没找到"）；smalltalk → 走 LLM 引导话术。
-            intent = _classify_intent(user_content, history)
-            if intent != "smalltalk":
-                answer = _NOT_FOUND_ANSWER if intent == "query" else _UNKNOWN_ANSWER
-                yield ("token", {"content": answer, "delta": answer, "ts": _ts()})
-                # 未调 LLM 无真实 token 消耗，合成 0 计数对齐评测契约（usage 必须在 done 前）
-                yield ("usage", {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "ts": _ts()})
-                assistant_id = _save_messages(db, session, user_content, answer, sources)
-                _compress_memory(db, session)
-                yield ("done", {"message_id": assistant_id, "ts": _ts()})
-                return
-
-        # 4. 流式调用 DeepSeek（解析 reasoning_content 思考过程 + content 回答 + usage）
-        messages = _build_messages(summary, history, context, user_content, low_confidence=low_confidence)
+        llm_rounds = 0
+        usage_total = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+        sources: list = []
         full_answer = ""
         full_reasoning = ""
-        usage: dict | None = None
+
+        def _merge_usage(usage: dict) -> None:
+            """多轮调用的 token 消耗合并进 usage_total（done 前统一发出一个 usage 事件）"""
+            for k in usage_total:
+                usage_total[k] += usage.get(k, 0) or 0
+
+        # 1. 第一轮：LLM 带 hybrid_retrieve 工具，自主决定是否检索
+        messages = _build_messages(summary, history, user_content)
+        tool_calls = None
         try:
-            for ev in _stream_deepseek(messages):
+            for ev in _stream_deepseek(messages, tools=[RETRIEVE_TOOL_SCHEMA]):
+                llm_rounds = 1
                 if ev["type"] == "usage":
-                    # 透传真实 token 消耗（评测契约必选字段）
-                    usage = ev["usage"]
-                    yield ("usage", {**ev["usage"], "ts": _ts()})
+                    _merge_usage(ev["usage"])
                 elif ev["type"] == "reasoning":
                     full_reasoning += ev["content"]
                     yield ("reasoning", {"content": ev["content"], "delta": ev["content"], "ts": _ts()})
-                else:
+                elif ev["type"] == "tool_call":
+                    tool_calls = ev["tool_calls"]
+                else:  # content：LLM 直接回答（决定不检索或未命中前先输出思考文本）
                     full_answer += ev["content"]
                     yield ("token", {"content": ev["content"], "delta": ev["content"], "ts": _ts()})
         except Exception as e:
-            logger.error("[chat] LLM 流式失败: %s", e)
+            logger.error("[chat] LLM 第一轮流式失败: %s", e)
             yield ("error", {"message": "LLM 调用失败，请稍后重试"})
             return
 
-        # 5. 保存消息（含标题生成）+ 记忆压缩
+        decided_retrieve = tool_calls is not None
+        result = None
+        if decided_retrieve:
+            # 2. LLM 决定检索：执行工具，检索完成后再发 tool_call（result 带真实结果）
+            try:
+                args = json.loads(tool_calls[0]["function"]["arguments"] or "{}")
+                query = args.get("query") or user_content
+                result = _execute_retrieve_tool(session.library_id, query)
+                status = "ok"
+            except Exception as e:
+                logger.warning("[chat] 检索工具执行失败: %s", e)
+                query = user_content
+                result = None
+                status = "error"
+            yield ("tool_call", {
+                "id": f"retrieve-{_ts()}",
+                "name": "hybrid_retrieve",
+                "args": {"query": query},
+                "result": (
+                    {k: result[k] for k in ("source_count", "max_score", "confidence_band")}
+                    if result else {}
+                ),
+                "status": status,
+                "ts": _ts(),
+            })
+
+            # 3. 命中：推 sources + 第二轮 LLM 基于 tool 结果作答；空：规则三路兜底
+            if result and result["source_count"] > 0:
+                sources = result["sources"]
+                yield ("sources", {"sources": sources, "ts": _ts()})
+                # DeepSeek tool 轮次必须回传 assistant 的 tool_calls + reasoning_content，否则报错
+                messages += [
+                    {"role": "assistant", "content": "", "reasoning_content": full_reasoning,
+                     "tool_calls": tool_calls},
+                    {"role": "tool", "tool_call_id": tool_calls[0]["id"],
+                     "content": json.dumps(
+                         {"context": result["context"], "confidence_band": result["confidence_band"]},
+                         ensure_ascii=False)},
+                ]
+                try:
+                    for ev in _stream_deepseek(messages):  # 第二轮不带 tools，防再循环
+                        llm_rounds = 2
+                        if ev["type"] == "usage":
+                            _merge_usage(ev["usage"])
+                        elif ev["type"] == "reasoning":
+                            full_reasoning += ev["content"]
+                            yield ("reasoning", {"content": ev["content"], "delta": ev["content"], "ts": _ts()})
+                        elif ev["type"] == "tool_call":
+                            continue
+                        else:
+                            full_answer += ev["content"]
+                            yield ("token", {"content": ev["content"], "delta": ev["content"], "ts": _ts()})
+                except Exception as e:
+                    logger.error("[chat] LLM 第二轮流式失败: %s", e)
+                    yield ("error", {"message": "LLM 调用失败，请稍后重试"})
+                    return
+            else:
+                # 检索空 → 规则三路兜底（用户确认）：query 如实"未找到"、unknown 澄清、smalltalk 引导
+                intent = _classify_intent(user_content, history)
+                if intent != "smalltalk":
+                    answer = _NOT_FOUND_ANSWER if intent == "query" else _UNKNOWN_ANSWER
+                    full_answer = answer
+                    yield ("token", {"content": answer, "delta": answer, "ts": _ts()})
+                else:
+                    # 寒暄却被 LLM 检索且空（模型行为异常，低频）：第二轮 LLM 自然引导，不传 tools
+                    messages += [
+                        {"role": "assistant", "content": "", "reasoning_content": full_reasoning,
+                         "tool_calls": tool_calls},
+                        {"role": "tool", "tool_call_id": tool_calls[0]["id"],
+                         "content": json.dumps(
+                             {"context": "（本次未检索到相关文档内容）", "confidence_band": "none"},
+                             ensure_ascii=False)},
+                    ]
+                    try:
+                        for ev in _stream_deepseek(messages):
+                            llm_rounds = 2
+                            if ev["type"] == "usage":
+                                _merge_usage(ev["usage"])
+                            elif ev["type"] == "reasoning":
+                                full_reasoning += ev["content"]
+                                yield ("reasoning", {"content": ev["content"], "delta": ev["content"], "ts": _ts()})
+                            elif ev["type"] == "tool_call":
+                                continue
+                            else:
+                                full_answer += ev["content"]
+                                yield ("token", {"content": ev["content"], "delta": ev["content"], "ts": _ts()})
+                    except Exception as e:
+                        logger.error("[chat] LLM 引导轮流式失败: %s", e)
+                        yield ("error", {"message": "LLM 调用失败，请稍后重试"})
+                        return
+
+        # 4. 监控日志：tool 决策（规则分类器仅对比，不干预——用户确认"信任 LLM"）
+        rule_intent = _classify_intent(user_content, history)
+        _json_log(
+            "tool_decision",
+            session_id=session_id,
+            iteration=1,
+            llm_decided=decided_retrieve,
+            tool="hybrid_retrieve" if decided_retrieve else None,
+            source_count=(result or {}).get("source_count"),
+            max_score=(result or {}).get("max_score"),
+            confidence_band=(result or {}).get("confidence_band"),
+            rule_intent=rule_intent,
+            rule_agree=(rule_intent == "query") == decided_retrieve,
+            llm_rounds=llm_rounds,
+            total_tokens=usage_total["total_tokens"],
+            duration_ms=int((time.time() - t_start) * 1000),
+        )
+
+        # 5. usage（多轮合并为一个）+ 保存消息 + 记忆压缩
+        yield ("usage", {**usage_total, "ts": _ts()})
         assistant_id = _save_messages(db, session, user_content, full_answer, sources)
         _compress_memory(db, session)
+        _json_log(
+            "chat_request",
+            session_id=session_id,
+            llm_rounds=llm_rounds,
+            total_tokens=usage_total["total_tokens"],
+            decided_retrieve=decided_retrieve,
+            duration_ms=int((time.time() - t_start) * 1000),
+        )
 
         # 6. done
         yield ("done", {"message_id": assistant_id, "ts": _ts()})

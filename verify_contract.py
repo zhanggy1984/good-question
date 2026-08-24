@@ -1,12 +1,12 @@
 """good-question 契约改造（B.1）运行时验证。
 
 登录 admin → 复用/新建文档库 → 建会话 → 调 /api/chat/{sid} 读 SSE，
-校验事件流符合评测契约 §5.1（路径 A）：
-- 事件顺序：meta 首个，done 最后，usage 在 done 前
+校验事件流符合评测契约 §5.1（路径 A，二期 function calling 编排）：
+- 事件顺序：meta 首个，done 最后，usage（多轮合并）在 done 前
 - meta 含 agent/model/interface/contract_version/git_sha/knowledge_version/ts
 - reasoning/token 的 data 同时含 content+delta（兼容前端 content 与评测 delta）并带 ts
 - usage 含 prompt_tokens/completion_tokens/total_tokens 并带 ts
-- 有文档时出现 tool_call（id/name/args/result/status/ts）
+- LLM 决定检索时才出现 tool_call（id/name/args/result/status/ts），命中后跟 sources
 
 宿主机运行：python verify_contract.py
 """
@@ -102,7 +102,7 @@ def main() -> None:
         p(f"  usage: prompt={usage['prompt_tokens']} completion={usage['completion_tokens']} "
           f"total={usage['total_tokens']}")
 
-        # 10. tool_call（有文档库时才出现）
+        # 10. tool_call（二期：LLM 决定检索时才出现；命中后另有 sources 事件）
         if any(e["type"] == "tool_call" for e in events):
             tc = next(e["data"] for e in events if e["type"] == "tool_call")
             for k in ("id", "name", "args", "result", "status", "ts"):
@@ -110,9 +110,9 @@ def main() -> None:
             p(f"  tool_call: name={tc['name']} status={tc['status']} "
               f"source_count={tc['result'].get('source_count')}")
         else:
-            p("  无 tool_call（当前库无文档，检索为空，符合预期）")
+            p("  无 tool_call（LLM 决定不检索：闲聊/直接回答，符合二期语义）")
 
-        p("✅ 契约事件流验证通过（meta → tool_call? → reasoning/token* → usage → done，全事件带 ts）")
+        p("✅ 契约事件流验证通过（meta → reasoning*/token* → [tool_call → sources]? → reasoning*/token* → usage → done，全事件带 ts）")
 
 
 if __name__ == "__main__":
