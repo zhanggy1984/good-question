@@ -77,6 +77,43 @@ _UNKNOWN_ANSWER = (
     "请换个说法，或告诉我您想了解文档库中哪方面的信息。"
 )
 
+# 规则否决权（F3）第二轮引导语：LLM 首轮已直接答（可能编造），否决命中后带上检索结果
+# 让其基于文档重新作答。注意 LLM 首轮未产出 tool_calls，不能走 tool 消息回传
+# （DeepSeek 要求 tool 消息前必须有对应 assistant tool_calls），只能以 user 消息注入 context。
+_OVERRIDE_CONTEXT_PROMPT = (
+    "已为你检索到以下文档内容。请基于这些内容重新回答用户刚才的问题，"
+    "可用 [来源N] 标注引用，不要复述之前的回答。\n{context}"
+)
+
+# F3 否决豁免模式：明显无需查文档的通用问题（纯计算/当前时间/通用常识）——强制检索只会误伤，
+# 如"17×23 等于多少"被否决强制检索空后追加"未找到"，造成"先答再补未找到"的割裂体验（F3-1 实测）。
+# 命中即视为与文档库内容无关：跳过否决，docs 空兜底时也交 LLM 自然作答而非"未找到"。
+# 收紧匹配防误伤文档问题：算术式要求整串为数字运算（"3-5 天"不命中）、时间类锚定"今天/星期"等。
+_NON_DOC_QUESTION_PATTERNS = (
+    # 纯算术整串："17×23"、"17 乘以 23 等于多少"、"1+1等于几"
+    re.compile(r"^\d+\s*(?:乘以|乘|加|加上|减|减去|除|除以|[+\-*/×÷])\s*\d+\s*(?:等于|是|就是)?\s*(?:多少|几|什么)?\s*[？?]?$"),
+    # 计算指令 + 数字运算："计算 17*23"、"帮我算一下 5 加 3"
+    re.compile(r"^(?:算一算|算一下|计算|帮我算|请计算)[^？?]*[+\-*/×÷乘以加减除]"),
+    # 实时信息（文档库不可能有）：今天/现在/明天 + 星期/日期/时间
+    re.compile(r"^(?:今天|现在|当前|明天)(?:是)?(?:星期几|星期[一二三四五六日天]|几月几号|几点|几点几分|什么时间|几号)"),
+    re.compile(r"^(?:今天|明天|后天)(?:的)?(?:天气|气温|温度|会不会下雨|下雨吗)"),
+    # 通用常识白名单（与具体文档内容无关的百科类）
+    re.compile(r"^(?:圆周率|光速|地球|太阳系|水的沸点|一公斤等于|一年有|一天有)"),
+)
+
+
+def _is_non_doc_question(text: str) -> bool:
+    """F3 豁免判定：明显无需查文档的通用问题（纯计算/当前时间/通用常识）
+
+    这类问题 LLM 能直接答对，否决强制检索只会造成"先答再补未找到"的割裂体验。
+    命中 → 跳过否决；docs 空兜底时同样不走"未找到"话术（交 LLM 自然作答）。
+    抽成纯函数便于单元测试覆盖（tests/test_chat_service.py）。
+    """
+    t = text.strip()
+    if not t:
+        return False
+    return any(p.match(t) for p in _NON_DOC_QUESTION_PATTERNS)
+
 # 轻量规则意图分类词表（仅用于 docs 空时区分"引导话术"与"如实未找到"）
 # 身份类闲聊：最特定（"你是谁/你能做什么"），即便含疑问词也判闲聊——优先于查询意图
 _IDENTITY_SMALLTALK = (
@@ -580,6 +617,10 @@ def stream_chat(session_id: int, user_content: str):
 
         decided_retrieve = tool_calls is not None
         result = None
+        rule_override = False  # 外层初始化：监控日志在 if/elif 之外引用（默认不否决）
+        # rule_intent / non_doc_question 提前计算：否决条件（elif）需要，监控日志复用（避免重复计算）
+        rule_intent = _classify_intent(user_content, history)
+        non_doc_question = _is_non_doc_question(user_content)
         if decided_retrieve:
             # 2. LLM 决定检索：执行工具，检索完成后再发 tool_call（result 带真实结果）
             try:
@@ -635,14 +676,16 @@ def stream_chat(session_id: int, user_content: str):
                     yield ("error", {"message": "LLM 调用失败，请稍后重试"})
                     return
             else:
-                # 检索空 → 规则三路兜底（用户确认）：query 如实"未找到"、unknown 澄清、smalltalk 引导
+                # 检索空 → 规则三路兜底（用户确认）：query 如实"未找到"、unknown 澄清、smalltalk 引导；
+                # 纯计算/常识类（非文档问题）也交 LLM 自然作答，不说"未找到"
                 intent = _classify_intent(user_content, history)
-                if intent != "smalltalk":
+                if intent != "smalltalk" and not non_doc_question:
                     answer = _NOT_FOUND_ANSWER if intent == "query" else _UNKNOWN_ANSWER
                     full_answer = answer
                     yield ("token", {"content": answer, "delta": answer, "ts": _ts()})
                 else:
-                    # 寒暄却被 LLM 检索且空（模型行为异常，低频）：第二轮 LLM 自然引导，不传 tools
+                    # 寒暄/非文档问题却被 LLM 检索且空（模型行为异常/计算题检空，低频）：
+                    # 第二轮 LLM 自然引导，不传 tools
                     messages += [
                         {"role": "assistant", "content": "", "reasoning_content": full_reasoning,
                          "tool_calls": tool_calls},
@@ -669,19 +712,79 @@ def stream_chat(session_id: int, user_content: str):
                         yield ("error", {"message": "LLM 调用失败，请稍后重试"})
                         return
 
-        # 4. 监控日志：tool 决策（规则分类器仅对比，不干预——用户确认"信任 LLM"）
-        rule_intent = _classify_intent(user_content, history)
+        elif (settings.rule_override_enabled
+              and rule_intent in ("query", "unknown")
+              and not non_doc_question):
+            # F3 规则否决权：LLM 决定不检索但规则判该查（query/unknown）→ 强制检索，防直接编造
+            # 纯计算/常识等非文档问题豁免（_is_non_doc_question），LLM 直接答即可，强制检索只会误伤
+            rule_override = True
+            query = user_content
+            try:
+                result = _execute_retrieve_tool(session.library_id, query)
+                status = "rule_override"
+            except Exception as e:
+                logger.warning("[chat] 规则否决检索失败: %s", e)
+                result = None
+                status = "rule_override_error"
+            yield ("tool_call", {
+                "id": f"retrieve-{_ts()}",
+                "name": "hybrid_retrieve",
+                "args": {"query": query},
+                "result": (
+                    {k: result[k] for k in ("source_count", "max_score", "confidence_band")}
+                    if result else {}
+                ),
+                "status": status,
+                "ts": _ts(),
+            })
+            if result and result["source_count"] > 0:
+                sources = result["sources"]
+                yield ("sources", {"sources": sources, "ts": _ts()})
+                # 第二轮：LLM 未调工具，不能回传 tool_calls/tool 消息，用 user 消息带 context 重答
+                messages += [
+                    {"role": "user",
+                     "content": _OVERRIDE_CONTEXT_PROMPT.format(context=result["context"])},
+                ]
+                try:
+                    for ev in _stream_deepseek(messages):  # 不带 tools，防再循环
+                        llm_rounds = 2
+                        if ev["type"] == "usage":
+                            _merge_usage(ev["usage"])
+                        elif ev["type"] == "reasoning":
+                            full_reasoning += ev["content"]
+                            yield ("reasoning", {"content": ev["content"], "delta": ev["content"], "ts": _ts()})
+                        elif ev["type"] == "tool_call":
+                            continue
+                        else:
+                            full_answer += ev["content"]
+                            yield ("token", {"content": ev["content"], "delta": ev["content"], "ts": _ts()})
+                except Exception as e:
+                    logger.error("[chat] 规则否决第二轮流式失败: %s", e)
+                    yield ("error", {"message": "LLM 调用失败，请稍后重试"})
+                    return
+            else:
+                # 检索也空：固定话术（query→未找到、unknown→澄清），防空 context 再编造
+                answer = _NOT_FOUND_ANSWER if rule_intent == "query" else _UNKNOWN_ANSWER
+                full_answer += answer
+                yield ("token", {"content": answer, "delta": answer, "ts": _ts()})
+
+        # 4. 监控日志：tool 决策（规则分类器对比；否决时强制检索，rule_override=True 标记）
         _json_log(
             "tool_decision",
             session_id=session_id,
             iteration=1,
             llm_decided=decided_retrieve,
-            tool="hybrid_retrieve" if decided_retrieve else None,
+            rule_override=rule_override,  # True=本次检索是规则强制而非 LLM 决策
+            non_doc_question=non_doc_question,  # True=豁免（纯计算/常识），否决与"未找到"均跳过
+            tool="hybrid_retrieve" if (decided_retrieve or rule_override) else None,
             source_count=(result or {}).get("source_count"),
             max_score=(result or {}).get("max_score"),
             confidence_band=(result or {}).get("confidence_band"),
             rule_intent=rule_intent,
-            rule_agree=(rule_intent == "query") == decided_retrieve,
+            # rule_agree = 规则判该查（query/unknown）⇔ LLM 决策检索。否决时必为 False（LLM 与规则
+            # 不一致），与 rule_override=True 组合即"不一致但已否决修正"；unknown 也是"该查"集合，
+            # 不能用二期 (rule_intent=='query') 公式（否则 unknown 否决时 rule_agree 误报 True）
+            rule_agree=(rule_intent in ("query", "unknown")) == decided_retrieve,
             llm_rounds=llm_rounds,
             total_tokens=usage_total["total_tokens"],
             duration_ms=int((time.time() - t_start) * 1000),

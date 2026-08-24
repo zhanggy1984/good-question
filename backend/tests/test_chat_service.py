@@ -478,6 +478,215 @@ def test_stream_chat_retrieve_empty_smalltalk_second_round(monkeypatch):
     assert "文档问答助手" in tok["content"]
 
 
+# ════════ 三期 F3 规则否决权测试（LLM 决定不检索但规则判该查 → 强制检索）════════
+
+
+def test_stream_chat_rule_override_hit(monkeypatch):
+    """F3 否决命中：rule=query + LLM 不检 → 强制检索 → tool_call(rule_override) + sources + 第二轮补答"""
+    _patch_chat_pipeline(
+        monkeypatch,
+        tool_result=_TOOL_RESULT_HIT,
+        round1=[
+            {"type": "content", "content": "工资发放日为每月 10 号。"},  # LLM 首轮不检直接答
+            {"type": "usage", "usage": {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5}},
+        ],
+        round2=[
+            {"type": "content", "content": "基于文档，工资发放日为每月 10 号。[来源1]"},
+            {"type": "usage", "usage": {"prompt_tokens": 4, "completion_tokens": 3, "total_tokens": 7}},
+        ],
+    )
+    events = list(cs.stream_chat(1, "工资发放日是几号"))
+    types = [t for t, _ in events]
+    # 首轮 token 已流出无法撤回 → 补答拼接在后
+    assert types == ["meta", "token", "tool_call", "sources", "token", "usage", "done"], f"实际 {types}"
+    tc = next(d for t, d in events if t == "tool_call")
+    assert tc["status"] == "rule_override", f"否决时 tool_call.status 应为 rule_override，实际 {tc['status']}"
+    assert tc["result"]["source_count"] == 1
+    toks = [d["content"] for t, d in events if t == "token"]
+    assert toks[0] == "工资发放日为每月 10 号。"   # 首轮 LLM 直接答（已流出）
+    assert "基于文档" in toks[1]                    # 第二轮基于 context 重答
+    assert "sources" in types
+
+
+def test_stream_chat_rule_override_empty_query_uses_not_found(monkeypatch):
+    """F3 否决但检索空 + query：tool_call(rule_override) → token(未找到)，第二轮不调（防空 context 编造）"""
+    _patch_chat_pipeline(
+        monkeypatch,
+        tool_result=_TOOL_RESULT_EMPTY,
+        round1=[{"type": "content", "content": "工资发放日为每月 10 号。"},
+                {"type": "usage", "usage": {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5}}],
+    )
+
+    def _fake_stream(messages, tools=None):
+        if tools:
+            return iter([{"type": "content", "content": "工资发放日为每月 10 号。"}])
+        raise AssertionError("否决后检索空 + query 不应调第二轮 LLM")
+
+    monkeypatch.setattr(cs, "_stream_deepseek", _fake_stream)
+    events = list(cs.stream_chat(1, "工资发放日是几号"))
+    types = [t for t, _ in events]
+    assert types == ["meta", "token", "tool_call", "token", "usage", "done"], f"实际 {types}"
+    assert "sources" not in types
+    toks = [d["content"] for t, d in events if t == "token"]
+    assert toks[0] == "工资发放日为每月 10 号。"   # 首轮
+    assert toks[1] == cs._NOT_FOUND_ANSWER         # 固定话术，防空 context 再编造
+
+
+def test_stream_chat_rule_override_empty_unknown_uses_clarify(monkeypatch):
+    """F3 否决但检索空 + unknown：tool_call(rule_override) → token(澄清) 而非"未找到" """
+    _patch_chat_pipeline(
+        monkeypatch,
+        tool_result=_TOOL_RESULT_EMPTY,
+        round1=[{"type": "content", "content": "Docker。"},
+                {"type": "usage", "usage": {"prompt_tokens": 3, "completion_tokens": 1, "total_tokens": 4}}],
+    )
+
+    def _fake_stream(messages, tools=None):
+        if tools:
+            return iter([{"type": "content", "content": "Docker。"}])
+        raise AssertionError("否决后检索空 + unknown 不应调第二轮 LLM")
+
+    monkeypatch.setattr(cs, "_stream_deepseek", _fake_stream)
+    events = list(cs.stream_chat(1, "Docker"))  # 无闲聊词也无查询标记 → unknown
+    toks = [d["content"] for t, d in events if t == "token"]
+    assert toks[-1] == cs._UNKNOWN_ANSWER
+    assert toks[-1] != cs._NOT_FOUND_ANSWER
+
+
+def test_stream_chat_rule_override_disabled(monkeypatch):
+    """F3 开关关闭：rule=query + LLM 不检 → 不否决，信任 LLM 直接答（无 tool_call）"""
+    monkeypatch.setattr(cs.settings, "rule_override_enabled", False)
+    _patch_chat_pipeline(
+        monkeypatch,
+        round1=[{"type": "content", "content": "工资发放日为每月 10 号。"},
+                {"type": "usage", "usage": {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5}}],
+    )
+    events = list(cs.stream_chat(1, "工资发放日是几号"))
+    types = [t for t, _ in events]
+    assert types == ["meta", "token", "usage", "done"], f"实际 {types}"
+    assert "tool_call" not in types and "sources" not in types
+
+
+def test_stream_chat_rule_override_smalltalk_not_triggered(monkeypatch):
+    """F3 范围排除：smalltalk + LLM 不检 → 不否决，无 tool_call（现有直接答路径不受否决影响）"""
+    _patch_chat_pipeline(
+        monkeypatch,
+        round1=[{"type": "content", "content": "你好，我是文档问答助手。"},
+                {"type": "usage", "usage": {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5}}],
+    )
+    events = list(cs.stream_chat(1, "你好"))  # smalltalk
+    types = [t for t, _ in events]
+    assert types == ["meta", "token", "usage", "done"], f"实际 {types}"
+    assert "tool_call" not in types
+
+
+def test_stream_chat_rule_override_log_field(monkeypatch):
+    """tool_decision 日志含 rule_override：否决=True、非否决=False（监控可分辨"否决修正"vs"不一致未处理"）"""
+    captured = []
+
+    def _log(kind, **fields):
+        captured.append({"kind": kind, **fields})
+
+    _patch_chat_pipeline(
+        monkeypatch,
+        tool_result=_TOOL_RESULT_EMPTY,
+        round1=[{"type": "content", "content": "工资发放日为每月 10 号。"},
+                {"type": "usage", "usage": {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5}}],
+    )
+    monkeypatch.setattr(cs, "_json_log", _log)
+    list(cs.stream_chat(1, "工资发放日是几号"))  # rule=query + LLM 不检 → 否决
+    td = next(x for x in captured if x["kind"] == "tool_decision")
+    assert td["rule_override"] is True
+    assert td["rule_agree"] is False          # 否决时规则与 LLM 必然不一致
+    assert td["llm_decided"] is False         # LLM 本意不检索
+    assert td["tool"] == "hybrid_retrieve"    # 实际执行了检索
+    # 非否决路径：smalltalk 不触发
+    captured.clear()
+    list(cs.stream_chat(1, "你好"))
+    td2 = next(x for x in captured if x["kind"] == "tool_decision")
+    assert td2["rule_override"] is False
+    assert td2["rule_agree"] is True
+    # unknown 触发否决：rule_agree 也应为 False（unknown 属于"该查"集合；
+    # 若沿用二期 query-only 公式会误报 True，无法区分"否决修正"vs"不一致未处理"）
+    captured.clear()
+    list(cs.stream_chat(1, "Docker"))  # unknown + LLM 不检 → 否决
+    td3 = next(x for x in captured if x["kind"] == "tool_decision")
+    assert td3["rule_override"] is True
+    assert td3["rule_agree"] is False
+
+
+def test_is_non_doc_question():
+    """_is_non_doc_question：纯计算/当前时间/通用常识 → True；文档类问题 → False（不误伤）"""
+    assert cs._is_non_doc_question("17 乘以 23 等于多少")
+    assert cs._is_non_doc_question("1+1等于几")
+    assert cs._is_non_doc_question("计算 17*23")
+    assert cs._is_non_doc_question("今天是星期几")
+    assert cs._is_non_doc_question("今天天气怎么样")
+    assert cs._is_non_doc_question("圆周率是多少")
+    # 文档类（演示库考勤/工资），不应豁免
+    assert not cs._is_non_doc_question("工资发放日是几号")
+    assert not cs._is_non_doc_question("请事假需要提前几天申请")
+    assert not cs._is_non_doc_question("加班费怎么算")
+    assert not cs._is_non_doc_question("帮我总结一下文档讲了什么")
+
+
+def test_stream_chat_rule_override_skipped_for_calc(monkeypatch):
+    """F3 豁免：纯计算题 + LLM 不检 → 不否决，直接答（无 tool_call，避免"先答再补未找到"）"""
+    _patch_chat_pipeline(
+        monkeypatch,
+        round1=[{"type": "content", "content": "17 × 23 = 391。"},
+                {"type": "usage", "usage": {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5}}],
+    )
+    events = list(cs.stream_chat(1, "17 乘以 23 等于多少"))
+    types = [t for t, _ in events]
+    assert types == ["meta", "token", "usage", "done"], f"实际 {types}"
+    assert "tool_call" not in types and "sources" not in types
+    tok = next(d for t, d in events if t == "token")
+    assert "391" in tok["content"]
+
+
+def test_stream_chat_retrieve_empty_calc_second_round(monkeypatch):
+    """检索空 + 纯计算题（LLM 检但空）：不走"未找到"，第二轮 LLM 自然作答（豁免非文档问题）"""
+    _patch_chat_pipeline(
+        monkeypatch,
+        tool_result=_TOOL_RESULT_EMPTY,
+        round1=[_TOOL_CALL_EVENT],
+        round2=[{"type": "content", "content": "17 × 23 = 391。"},
+                {"type": "usage", "usage": {"prompt_tokens": 4, "completion_tokens": 3, "total_tokens": 7}}],
+    )
+    events = list(cs.stream_chat(1, "17 乘以 23 等于多少"))
+    types = [t for t, _ in events]
+    assert types == ["meta", "tool_call", "token", "usage", "done"], f"实际 {types}"
+    tok = next(d for t, d in events if t == "token")
+    assert "391" in tok["content"]
+    assert tok["content"] != cs._NOT_FOUND_ANSWER
+
+
+def test_stream_chat_rule_override_error(monkeypatch):
+    """F3 否决但检索工具抛异常：tool_call status=rule_override_error + 空结果走固定话术，第二轮不调"""
+    _patch_chat_pipeline(
+        monkeypatch,
+        round1=[{"type": "content", "content": "工资发放日为每月 10 号。"},
+                {"type": "usage", "usage": {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5}}],
+    )
+
+    def _boom(library_id, query):
+        raise RuntimeError("milvus down")
+
+    def _fake_stream(messages, tools=None):
+        if tools:
+            return iter([{"type": "content", "content": "工资发放日为每月 10 号。"}])
+        raise AssertionError("否决检索失败 + query 不应调第二轮 LLM")
+
+    monkeypatch.setattr(cs, "_execute_retrieve_tool", _boom)
+    monkeypatch.setattr(cs, "_stream_deepseek", _fake_stream)
+    events = list(cs.stream_chat(1, "工资发放日是几号"))
+    tc = next(d for t, d in events if t == "tool_call")
+    assert tc["status"] == "rule_override_error"
+    toks = [d["content"] for t, d in events if t == "token"]
+    assert toks[-1] == cs._NOT_FOUND_ANSWER
+
+
 def test_contracts_manifest_endpoint():
     """GET /api/contracts：声明 LLM 评测接口与场景清单（平台自动发现用）"""
     from fastapi import FastAPI

@@ -88,6 +88,10 @@
 ### 4. Function Calling 编排 + SSE 事件流对齐评测契约
 `/api/chat/{session_id}` 采用**二期 function calling 编排**：LLM 第一轮带 `hybrid_retrieve` 工具**自主决定是否检索**（不调就不检），命中后经 tool 消息回传结果、第二轮基于检索结果作答；检索空走规则意图分类兜底（query→如实"未找到"、unknown→引导澄清、smalltalk→LLM 引导寒暄），防幻觉不变。每次请求的 tool 决策以 JSON 行结构化日志落盘（`kind=tool_decision`），监控 LLM 决策与规则判断的一致性（`rule_agree`）。
 
+**三期规则否决权（F3）**：规则判"该查"（`rule_intent ∈ {query, unknown}`）而 LLM 决定不检索时，**规则否决 LLM 决策、强制检索**——把"事后监控不一致"升级为"主动拦截编造"。否决命中后因首轮 token 已流式发出无法撤回，第二轮以 user 消息携带检索 context 引导 LLM 重新作答（LLM 未产出 tool_calls，不能走 tool 消息回传），补答拼接在首轮之后；否决后检索仍空则走固定话术（query→"未找到"、unknown→澄清），防空 context 再编造。可通过环境变量 `RULE_OVERRIDE_ENABLED=false` 关闭回滚到"信任 LLM"。`tool_decision` 日志新增 `rule_override` 字段：`True` 表示本次检索为规则强制，与 `rule_agree=false` 组合即"不一致但已否决修正"。
+
+**纯计算/常识豁免**：`_is_non_doc_question` 判定明显无需查文档的问题（纯计算如"17×23 等于多少"、当前时间/星期、通用常识白名单），命中则不否决、docs 空兜底也不说"未找到"（交 LLM 自然作答）——避免强制检索空后"先答再补未找到"的割裂体验。`tool_decision` 日志 `non_doc_question` 字段标记豁免，与 `rule_override=false` 组合区分"有意豁免"vs"漏判不一致"。
+
 事件序对齐评测契约 v1.0（路径 A：保留原事件名，前端零改动）——不同路径事件不同，前端只消费 `sources`/`reasoning`/`token`/`done`/`error`：
 
 ```
@@ -104,7 +108,7 @@ event: error      LLM 调用失败兜底
 
 - **全事件带 `ts`**（unix 毫秒），`reasoning`/`token` 的 data 同时含 `content` + `delta`，前端读 `content`、评测平台经 field_map 读 `delta`，两侧都兼容；
 - **所有请求第一轮必调 LLM**（判断是否检索），`usage` 恒反映真实消耗——一期"不调 LLM、usage 全 0"的路径已不存在；
-- **检索由 LLM 自主决定**：`tool_call`/`sources` 不再无条件出现，闲聊/直接回答路径只有 `meta → reasoning/token → usage → done`；
+- **检索由 LLM 自主决定，但受规则否决权约束（三期 F3）**：LLM 决定检索 → `tool_call(status=ok)`；LLM 决定不检索但规则判该查（query/unknown）→ 规则强制检索 → `tool_call(status=rule_override)`；仅闲聊/直接回答路径没有 `tool_call`/`sources`（`meta → reasoning/token → usage → done`）；
 - `meta` 中 `knowledge_version` 以**该会话文档库**最近上传时间为锚（按 `library_id` 过滤，多库部署不串库）；
 - 公开 `GET /api/contracts` 声明接口与 4 个场景清单，平台自动发现；
 - 前端 `sse.ts` 只消费 `sources`/`reasoning`/`token`/`done`/`error`，新增的 `meta`/`tool_call`/`usage` 事件自然忽略——路径 A，前端无需改动；

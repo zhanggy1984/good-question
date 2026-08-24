@@ -40,6 +40,10 @@ class Settings(BaseSettings):
     # 相关性存疑、不足以回答则如实说"未找到"，防止基于边缘相关片段编造答案
     rerank_low_confidence_threshold: float = 0.50
 
+    # F3 规则否决权开关：LLM 决定不检索但规则判该查（query/unknown）时强制检索，防直接编造。
+    # 可设 RULE_OVERRIDE_ENABLED=false 临时关闭回滚到"信任 LLM"（二期行为）
+    rule_override_enabled: bool = True
+
     # Admin
     admin_username: str = "admin"
     admin_password: str = "admin123"
