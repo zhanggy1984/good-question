@@ -40,6 +40,15 @@ export const getDocumentStatus = (id: number) => api.get<DocumentStatus>(`/docum
 
 export const deleteDocument = (id: number) => api.delete(`/documents/${id}`)
 
+export const reprocessDocument = (id: number, chunkSize?: number, overlapToken?: number) => {
+  const form = new FormData()
+  if (chunkSize !== undefined) form.append('chunk_size', String(chunkSize))
+  if (overlapToken !== undefined) form.append('overlap_token', String(overlapToken))
+  return api.post<Document>(`/documents/${id}/reprocess`, form, {
+    headers: { 'Content-Type': 'multipart/form-data' },
+  })
+}
+
 export interface ChunkItem {
   id: number
   chunk_index: number

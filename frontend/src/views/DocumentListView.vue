@@ -41,6 +41,7 @@ import { computed, h, onMounted, onUnmounted, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import {
   NButton,
+  NSpace,
   NTag,
   NPopconfirm,
   NDataTable,
@@ -49,7 +50,7 @@ import {
   NInputNumber,
 } from 'naive-ui'
 import type { DataTableColumns } from 'naive-ui'
-import { listDocuments, uploadDocument, deleteDocument, getDocumentStatus, type Document } from '@/api/document'
+import { listDocuments, uploadDocument, deleteDocument, getDocumentStatus, reprocessDocument, type Document } from '@/api/document'
 import { listLibraries } from '@/api/library'
 import { useAuthStore } from '@/stores/auth'
 import { message } from '@/utils/naive'
@@ -109,16 +110,34 @@ const columns = computed<DataTableColumns<Document>>(() => {
     cols.push({
       title: '操作',
       key: 'actions',
-      width: 80,
+      width: 140,
       render: (row) =>
-        h(
-          NPopconfirm,
-          { onPositiveClick: () => handleDelete(row) },
-          {
-            trigger: () => h(NButton, { text: true, type: 'error' }, { default: () => '删除' }),
-            default: () => `删除文档「${row.filename}」？`,
-          },
-        ),
+        h(NSpace, { size: 8 }, [
+          h(
+            NPopconfirm,
+            {
+              disabled: row.status === 'processing', // 处理中禁点防误触（后端 _try_acquire_processing 兜底）
+              onPositiveClick: () => handleReprocess(row),
+            },
+            {
+              trigger: () =>
+                h(
+                  NButton,
+                  { text: true, type: 'primary', disabled: row.status === 'processing' },
+                  { default: () => '重新处理' },
+                ),
+              default: () => `重新处理文档「${row.filename}」？将删除现有向量并重新切片/向量化。`,
+            },
+          ),
+          h(
+            NPopconfirm,
+            { onPositiveClick: () => handleDelete(row) },
+            {
+              trigger: () => h(NButton, { text: true, type: 'error' }, { default: () => '删除' }),
+              default: () => `删除文档「${row.filename}」？`,
+            },
+          ),
+        ]),
     })
   }
   return cols
@@ -142,7 +161,16 @@ function renderStatus(row: Document) {
     failed: { type: 'error', text: '失败' },
   }
   const s = map[row.status] || { type: 'default', text: row.status }
-  return h(NTag, { type: s.type, size: 'small' }, { default: () => s.text })
+  // failed 时 hover 状态 tag 显示失败原因，便于判断是否值得重试
+  return h(
+    NTag,
+    {
+      type: s.type,
+      size: 'small',
+      title: s.text === '失败' && row.error_message ? row.error_message : undefined,
+    },
+    { default: () => s.text },
+  )
 }
 
 async function fetchLibrary() {
@@ -183,6 +211,16 @@ async function handleUpload(e: Event) {
   } finally {
     uploading.value = false
     input.value = ''
+  }
+}
+
+async function handleReprocess(row: Document) {
+  try {
+    await reprocessDocument(row.id)
+    message.success('已重新处理，开始后台处理')
+    fetchData()
+  } catch (e: any) {
+    message.error(e.response?.data?.error?.message || '重新处理失败')
   }
 }
 

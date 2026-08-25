@@ -139,3 +139,21 @@ def delete_document(
     """删除文档（仅 admin）"""
     logger.debug("[document.delete] 入参 document_id=%s", document_id)
     document_service.delete_document(db, document_id)
+
+
+@router.post("/documents/{document_id}/reprocess", response_model=DocumentResponse)
+def reprocess_document(
+    document_id: int,
+    chunk_size: int = Form(None),
+    overlap_token: int = Form(None),
+    db: Session = Depends(get_db),
+    admin: User = Depends(get_admin_user),
+):
+    """重新处理文档（failed/ready 均可）：清旧向量与 chunks 后重跑管线，可选覆盖切分参数（仅 admin）"""
+    logger.debug(
+        "[document.reprocess] 入参 document_id=%s chunk_size=%s overlap_token=%s",
+        document_id, chunk_size, overlap_token,
+    )
+    doc = document_service.reprocess_document(db, document_id, chunk_size, overlap_token)
+    logger.debug("[document.reprocess] 出参 status=%s", doc.status)
+    return doc
