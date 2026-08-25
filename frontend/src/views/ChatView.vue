@@ -190,7 +190,23 @@ async function send(content: string) {
 
   try {
     await streamChat(sid as number, content, auth.token, (ev) => {
-      if (ev.type === 'sources') {
+      if (ev.type === 'tool_call') {
+        // 检索状态三态：failed=服务不可用（显示"可信度偏低"警告）、empty=已检索但空命中
+        // （显示"本次未检索到相关内容"）、hit=命中（走 sources 展示）。
+        // 无 tool_call 事件 = LLM 未检索直接答（问候/闲聊等），不标记。
+        // empty 提示仅对意图与文档相关（query/unknown，且非计算/常识豁免）显示——
+        // smalltalk 问候、non_doc 计算题的空命中后端交 LLM 自然作答，提示"未找到"会突兀。
+        const st = ev.data.status
+        if (st === 'error' || st === 'rule_override_error') {
+          chat.setRetrievalFailed()
+        } else if (
+          ev.data.result?.source_count === 0 &&
+          ev.data.intent !== 'smalltalk' &&
+          !ev.data.non_doc_question
+        ) {
+          chat.setRetrievalEmpty()
+        }
+      } else if (ev.type === 'sources') {
         chat.setAssistantSources(ev.data.sources)
       } else if (ev.type === 'reasoning') {
         chat.appendReasoning(ev.data.content)

@@ -8,6 +8,10 @@ export interface Message {
   reasoning?: string
   sources?: Source[]
   streaming?: boolean
+  /** 检索服务不可用（tool_call status=error/rule_override_error）时置位，UI 显示"可信度偏低"提示 */
+  retrievalFailed?: boolean
+  /** 检索正常但空命中（tool_call source_count=0）时置位，UI 显示"本次未检索到相关内容"提示 */
+  retrievalEmpty?: boolean
 }
 
 export const useChatStore = defineStore('chat', {
@@ -50,6 +54,18 @@ export const useChatStore = defineStore('chat', {
       const last = this.messages[this.messages.length - 1]
       if (last && last.role === 'assistant') {
         last.sources = sources
+      }
+    },
+    setRetrievalFailed() {
+      const last = this.messages[this.messages.length - 1]
+      if (last && last.role === 'assistant') {
+        last.retrievalFailed = true
+      }
+    },
+    setRetrievalEmpty() {
+      const last = this.messages[this.messages.length - 1]
+      if (last && last.role === 'assistant') {
+        last.retrievalEmpty = true
       }
     },
     finishAssistantMessage() {

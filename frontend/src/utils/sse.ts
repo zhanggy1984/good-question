@@ -1,7 +1,7 @@
 /** SSE 流式接收：POST /api/chat/{sessionId}，解析 event/data 块 */
 
 export interface ChatEvent {
-  type: 'sources' | 'token' | 'reasoning' | 'done' | 'error' | 'message'
+  type: 'sources' | 'token' | 'reasoning' | 'tool_call' | 'done' | 'error' | 'message'
   data: Record<string, any>
 }
 

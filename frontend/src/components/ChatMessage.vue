@@ -8,11 +8,17 @@
         </button>
         <div v-if="showReasoning" class="reasoning-content">{{ message.reasoning }}</div>
       </div>
+      <div v-if="message.retrievalFailed" class="retrieval-warning">
+        ⚠️ 检索服务暂不可用，以下回答未经文档验证，可信度偏低
+      </div>
       <div class="bubble">
         <span v-if="message.content">{{ message.content }}</span>
         <span v-else-if="message.streaming && !message.sources?.length" class="retrieving">
           🔍 检索中…
         </span>
+      </div>
+      <div v-if="message.retrievalEmpty" class="retrieval-empty">
+        ℹ️ 本次未检索到相关内容
       </div>
       <div v-if="message.sources && message.sources.length" class="sources">
         <button class="sources-toggle" @click="showSources = !showSources">
@@ -88,6 +94,23 @@ const showSources = ref(true)
 .retrieving {
   opacity: 0.5;
   font-size: 13px;
+}
+.retrieval-warning {
+  margin-bottom: 8px;
+  padding: 8px 12px;
+  border-left: 3px solid rgba(217, 160, 46, 0.8);
+  background: rgba(217, 160, 46, 0.12);
+  border-radius: 0 6px 6px 0;
+  font-size: 12px;
+  line-height: 1.5;
+  color: #e0b64c;
+  text-align: left;
+}
+.retrieval-empty {
+  margin-top: 8px;
+  font-size: 12px;
+  opacity: 0.55;
+  text-align: left;
 }
 .sources {
   margin-top: 8px;
