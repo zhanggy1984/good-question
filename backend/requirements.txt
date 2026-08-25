@@ -20,6 +20,9 @@ pydantic-settings==2.7.0
 # ── 异步 HTTP ──
 httpx==0.28.1
 
+# ── 聊天问答缓存（Redis）──
+redis==5.2.1
+
 # ── Milvus 向量库（LlamaIndex 统一管理：dense 语义检索 + BGE-M3 学习稀疏 + RRF 混合检索）──
 pymilvus>=2.5,<2.6
 
