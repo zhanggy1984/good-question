@@ -2,7 +2,7 @@
 
 > **多用户 RAG 文档问答系统**：文档上传即自动抽取 → 清洗 → 切片 → 向量化，之后基于文档库提问，大模型用**带来源标注、流式返回**的答案作答。私有知识有出处、可溯源、不编造，会话与文档库双隔离。
 
-本系统是**契约对齐的 RAG 演示项目**：7 服务一键启动、nginx 80 端口为唯一入口、LlamaIndex 统一混合检索（dense + BGE-M3 稀疏 + RRF 融合 + Rerank 精排）、function calling 编排（LLM 自主决定是否检索）+ 规则否决权（F3：该查不查时强制检索）+ 纯计算/常识豁免 + 两级置信档防幻觉、SSE 事件流对齐评测契约 v1.0（`meta`/`tool_call`/`usage` + 全事件 `ts`）、76 项单元测试 + 契约运行时验证脚本开箱即用。
+本系统是**契约对齐的 RAG 演示项目**：7 服务一键启动、nginx 80 端口为唯一入口、LlamaIndex 统一混合检索（dense + BGE-M3 稀疏 + RRF 融合 + Rerank 精排）、function calling 编排（LLM 自主决定是否检索）+ 规则否决权（F3：该查不查时强制检索）+ 纯计算/常识豁免 + 两级置信档防幻觉、SSE 事件流对齐评测契约 v1.0（`meta`/`tool_call`/`usage` + 全事件 `ts`）、Redis 问答缓存命中重放、134 项单元测试 + 契约运行时验证脚本开箱即用。
 
 ---
 
@@ -343,7 +343,7 @@ good-question/
 │   ├── middleware/           # JWT 鉴权 Depends
 │   ├── utils/                # mineru_extractor / mineru_api / text_cleaner / chunker / security / exceptions
 │   ├── alembic/              # 数据库迁移（versions/：0001~0003）
-│   ├── tests/                # 单元测试（76 个测试函数，pytest 已内置镜像）
+│   ├── tests/                # 单元测试（134 个测试函数，pytest 已内置镜像）
 │   ├── requirements.txt      # 生产依赖
 │   └── requirements-dev.txt  # 测试依赖（pytest，已装进镜像）
 ├── frontend/                 # Vue 3 + Naive UI 前端
@@ -369,7 +369,7 @@ good-question/
 
 | 层 | 内容 | 说明 |
 |----|------|------|
-| 单元测试 | `backend/tests/` 76 个测试函数 | 安全 / 清洗 / 切片 / 文档服务 / embedding / 检索 / 聊天服务 / llama_store（含两级置信档边界、闲聊粗判、未命中固定话术、F3 规则否决权与豁免分支），纯函数级，不依赖外部服务 |
+| 单元测试 | `backend/tests/` 134 个测试函数 | 安全 / 清洗 / 切片（含跨页全局 section、@@PAGE 页码）/ 文档服务（含 reprocess 双层防并发）/ embedding / 检索 / 聊天服务（含五维度防注入、两级置信档边界、闲聊粗判、未命中固定话术、F3 规则否决权与豁免分支）/ chat_cache（key 隔离、版本失效、熔断降级、SSE 重放事件序）/ llama_store，纯函数级，不依赖外部服务 |
 | 契约验证 | `verify_contract.py` | 运行时读真实 SSE 事件流，断言事件序（meta 首、usage 在 done 前）与字段完整（meta/tool_call/usage/reasoning/token/ts）；`tool_call.status` 支持 ok/error（LLM 决策）与 rule_override/rule_override_error（三期规则否决） |
 | 迁移验证 | `test-data/e2e.py` / `chat.py` / `verify_old_data.py` | 登录→建库→上传→就绪 / chat 完整链路读 SSE / 旧数据重灌后检索验证 |
 | 前端构建 | `npm run build` | 改了前端代码必须先 build，否则 nginx 里是旧页面 |
@@ -482,6 +482,7 @@ python verify_contract.py                                          # 宿主机�
 
 | 版本 | 日期 | 核心内容 |
 |------|------|----------|
+| **2.0.2** | 2026-08-25 | Redis 问答缓存：精确 key（库+模型+问题 sha256）、连接熔断降级、库级失效、缓存命中 SSE 事件重放（事件序对齐真实流程 + `intent`/`non_doc_question` 透传防前端误示空命中）；Prompt 五维度法防注入 + 检索服务不可用兜底 + query 清洗；`tool_call` 检索三态透传（前端空命中/可信度偏低提示）；chunk 跨页全局 section 切分 + `@@PAGE` 页码标记 + 清洗增强；文档重新处理（reprocess）：failed/ready 重试、可选切分参数覆盖、双层防并发（内存原子占用 + DB status） |
 | **2.0.1** | 2026-08-24 | 三期 F3 规则否决权：LLM 决定不检索但规则判该查（query/unknown）时强制检索防编造；纯计算/常识豁免（`_is_non_doc_question`）；`rule_agree` 公式修正（unknown 纳入"该查"集合）；`tool_call.status` 新增 `rule_override`/`rule_override_error`；`tool_decision` 日志加 `rule_override`/`non_doc_question` 字段 |
 | **2.0** | 2026-08 | 二期 function calling 编排：LLM 自主决定是否检索 + 空结果规则意图兜底；SSE 事件流对齐评测契约 v1.0（`meta`/`tool_call`/`usage` + 全事件 `ts`）；`meta.git_sha` 构建注入；多轮记忆压缩；README 全面重写 |
 | **1.1** | — | 镜像内置测试依赖 pytest，容器内 pytest 开箱即用 |
