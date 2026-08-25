@@ -84,3 +84,46 @@ def test_flush_delegates_to_client_flush(monkeypatch):
     monkeypatch.setattr(llama_store, "_get_store", lambda: _FakeStore())
     llama_store.flush()
     assert _FakeStore.client.called_with == llama_store.COLLECTION_NAME
+
+
+def test_ensure_loaded_skips_when_collection_missing(monkeypatch):
+    """collection 不存在（首启未传文档）时跳过 load，不抛错
+
+    守护 ensure_loaded 的分支：Milvus 重启后 collection 不自动 load，
+    不 load 检索会报 "collection not loaded"；但首启集合不存在时 has_collection 探为 False 应静默跳过。
+    """
+    class _FakeClient:
+        def __init__(self):
+            self.loaded = False
+
+        def has_collection(self, name):
+            return False
+
+        def load_collection(self, name):
+            self.loaded = True
+            self.loaded_name = name
+
+    fake = _FakeClient()
+    monkeypatch.setattr(llama_store, "_get_milvus_client", lambda: fake)
+    llama_store.ensure_loaded()
+    assert fake.loaded is False
+
+
+def test_ensure_loaded_loads_existing_collection(monkeypatch):
+    """collection 已存在（重启后未自动 load）时调用 load_collection(COLLECTION_NAME)"""
+    class _FakeClient:
+        def __init__(self):
+            self.loaded = False
+
+        def has_collection(self, name):
+            return True
+
+        def load_collection(self, name):
+            self.loaded = True
+            self.loaded_name = name
+
+    fake = _FakeClient()
+    monkeypatch.setattr(llama_store, "_get_milvus_client", lambda: fake)
+    llama_store.ensure_loaded()
+    assert fake.loaded is True
+    assert fake.loaded_name == llama_store.COLLECTION_NAME

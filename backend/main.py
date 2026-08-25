@@ -43,6 +43,14 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning("[lifespan] 模型预热失败（不影响启动）: %s", e)
 
+    # 加载 Milvus collection（rag_chunks）：Milvus 重启后 collection 不自动 load，
+    # 不 load 检索会报错。失败仅告警，不影响启动。
+    try:
+        from services.llama_store import ensure_loaded
+        ensure_loaded()
+    except Exception as e:
+        logger.warning("[lifespan] Milvus collection 加载失败（不影响启动）: %s", e)
+
     yield
     logger.info("[lifespan] Native RAG 关闭")
 

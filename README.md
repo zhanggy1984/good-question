@@ -2,9 +2,20 @@
 
 > **多用户 RAG 文档问答系统**：文档上传即自动抽取 → 清洗 → 切片 → 向量化，之后基于文档库提问，大模型用**带来源标注、流式返回**的答案作答。私有知识有出处、可溯源、不编造，会话与文档库双隔离。
 
-本系统是**契约对齐的 RAG 文档问答系统**：7 服务一键启动、nginx 80 端口为唯一入口、LlamaIndex 统一混合检索（dense + BGE-M3 稀疏 + RRF 融合 + Rerank 精排）、function calling 编排（LLM 自主决定是否检索）+ 规则否决权（F3：该查不查时强制检索）+ 纯计算/常识豁免 + 两级置信档防幻觉、SSE 事件流对齐评测契约 v1.0（`meta`/`tool_call`/`usage` + 全事件 `ts`）、Redis 问答缓存命中重放、134 项单元测试 + 契约运行时验证脚本开箱即用。
+本系统是**契约对齐的 RAG 文档问答系统**：共享 infra + 2 应用服务一键启动、nginx 8089 端口为唯一入口、LlamaIndex 统一混合检索（dense + BGE-M3 稀疏 + RRF 融合 + Rerank 精排）、function calling 编排（LLM 自主决定是否检索）+ 规则否决权（F3：该查不查时强制检索）+ 纯计算/常识豁免 + 两级置信档防幻觉、SSE 事件流对齐评测契约 v1.0（`meta`/`tool_call`/`usage` + 全事件 `ts`）、Redis 问答缓存命中重放、138 项单元测试 + 契约运行时验证脚本开箱即用。
 
 ---
+
+> ## ⚠️ 前置依赖：共享 infra
+>
+> 本 agent **不自带任何中间件**，运行前须先部署共享 infra（MySQL/Redis/Milvus/BGE-M3 等）。
+>
+> ```bash
+> # 发布物：clone infra 独立仓库后启动
+> git clone https://github.com/zhanggy1984/share-infra && cd infra && docker compose up -d
+> # 本地开发：infra 位于 ../infra
+> cd ../infra && docker compose up -d
+> ```
 
 ## 目录
 
@@ -201,13 +212,14 @@ graph TB
 | 检索存储 | Milvus 2.5 Standalone（LlamaIndex 托管） | dense + BGE-M3 稀疏双路，RRF 融合，library_id 字段级库隔离 |
 | 关系库 | MySQL 8.0 + SQLAlchemy 2 + Alembic | 6 张表，迁移统一管理 |
 | 大模型 | DeepSeek（OpenAI 兼容协议，模型可切换） | 流式输出 + reasoning_content + function calling（自主检索）+ usage |
-| 部署 | Docker Compose（7 服务） | 一键启动，数据卷持久化，健康检查编排 |
+| 部署 | Docker Compose（共享 infra + 2 应用服务） | 一键启动，数据卷持久化，健康检查编排 |
 
 ---
 
 ## 六、快速开始（3 步跑起来）
 
 > 前置：Docker Desktop（Linux 容器）、Python 3.11（跑宿主机验证脚本用）。
+> **共享 infra**：本 agent 不自带任何中间件（MySQL/Redis/Milvus 由共享 infra 提供）。启动前先部署 infra（见 infra 仓库 README：`docker compose up -d`）。
 
 ### 第 1 步：配置环境变量
 
@@ -220,20 +232,22 @@ cp .env.example .env
 #   MINERU_API_TOKEN=              # 可选；留空用本地解析，填了走 MinerU 官方 API
 ```
 
-### 第 2 步：一键启动全栈（7 个服务）
+### 第 2 步：启动应用容器（backend + nginx）
 
 ```bash
 docker compose up -d
 # 首次含镜像构建（torch CPU + MinerU 依赖，体积 8-12GB、耗时数十分钟）
-docker compose ps                 # mysql/etcd/minio/milvus/attu/backend/nginx 全 healthy
+docker compose ps                 # rag-backend / rag-nginx 全部 Up + healthy
 curl localhost:8080/api/health    # {"status":"ok","service":"Native RAG"}
 ```
+
+> 本 agent 只起应用容器；MySQL/Redis/Milvus 全在共享 infra（库 `native_rag`、redis db/2、collection `rag_chunks`）。
 
 ### 第 3 步：访问
 
 ```bash
-open http://localhost          # 浏览器前端（nginx 80 端口）
-open http://localhost:8000     # Attu：Milvus 可视化管理 UI
+open http://localhost:8089    # 浏览器前端（nginx 8089 端口）
+open http://localhost:38000   # Attu：Milvus 可视化管理 UI（共享 infra）
 ```
 
 **默认账号**（首次启动自动创建，强烈建议改密码）：
@@ -322,7 +336,7 @@ python test-data/chat.py            # chat 完整链路：登录→建会话→�
 
 ```
 good-question/
-├── docker-compose.yml        # 7 服务编排（mysql/etcd/minio/milvus/attu/backend/nginx）
+├── docker-compose.yml        # 2 应用服务（backend/nginx），中间件由共享 infra 提供
 ├── .env / .env.example       # 环境配置（.env.example 每项含注释）
 ├── init.sql                  # 建库脚本（表结构由 Alembic 迁移管理）
 ├── prd.txt                   # PRD 需求（原始需求）
@@ -343,7 +357,7 @@ good-question/
 │   ├── middleware/           # JWT 鉴权 Depends
 │   ├── utils/                # mineru_extractor / mineru_api / text_cleaner / chunker / security / exceptions
 │   ├── alembic/              # 数据库迁移（versions/：0001~0003）
-│   ├── tests/                # 单元测试（134 个测试函数，pytest 已内置镜像）
+│   ├── tests/                # 单元测试（138 个测试函数，pytest 已内置镜像）
 │   ├── requirements.txt      # 生产依赖
 │   └── requirements-dev.txt  # 测试依赖（pytest，已装进镜像）
 ├── frontend/                 # Vue 3 + Naive UI 前端
@@ -369,7 +383,7 @@ good-question/
 
 | 层 | 内容 | 说明 |
 |----|------|------|
-| 单元测试 | `backend/tests/` 134 个测试函数 | 安全 / 清洗 / 切片（含跨页全局 section、@@PAGE 页码）/ 文档服务（含 reprocess 双层防并发）/ embedding / 检索 / 聊天服务（含五维度防注入、两级置信档边界、闲聊粗判、未命中固定话术、F3 规则否决权与豁免分支）/ chat_cache（key 隔离、版本失效、熔断降级、SSE 重放事件序）/ llama_store，纯函数级，不依赖外部服务 |
+| 单元测试 | `backend/tests/` 138 个测试函数 | 安全 / 清洗 / 切片（含跨页全局 section、@@PAGE 页码）/ 文档服务（含 reprocess 双层防并发）/ embedding / 检索 / 聊天服务（含五维度防注入、两级置信档边界、闲聊粗判、未命中固定话术、F3 规则否决权与豁免分支）/ chat_cache（key 隔离、版本失效、熔断降级、SSE 重放事件序）/ llama_store，纯函数级，不依赖外部服务 |
 | 契约验证 | `verify_contract.py` | 运行时读真实 SSE 事件流，断言事件序（meta 首、usage 在 done 前）与字段完整（meta/tool_call/usage/reasoning/token/ts）；`tool_call.status` 支持 ok/error（LLM 决策）与 rule_override/rule_override_error（三期规则否决） |
 | 迁移验证 | `test-data/e2e.py` / `chat.py` / `verify_old_data.py` | 登录→建库→上传→就绪 / chat 完整链路读 SSE / 旧数据重灌后检索验证 |
 | 前端构建 | `npm run build` | 改了前端代码必须先 build，否则 nginx 里是旧页面 |
@@ -455,10 +469,10 @@ python verify_contract.py                                          # 宿主机�
 |------|------|
 | 首次提问很慢 | 模型首次加载（embedding/rerank）需几秒；已在 lifespan 中预热，重启后首次提问前加载 |
 | `DEEPSEEK_API_KEY` 无效 | 检查 `.env` 的 `DEEPSEEK_API_KEY`；`verify_contract.py` 会直接暴露 LLM 调用失败 |
-| 前端 80 端口白屏 | `frontend/` 未构建 dist：`cd frontend && npm run build && docker compose build nginx && docker compose up -d nginx` |
+| 前端 8089 端口白屏 | `frontend/` 未构建 dist：`cd frontend && npm run build && docker compose build nginx && docker compose up -d nginx` |
 | 改了后端代码不生效 | 后端源码在镜像内，需 `docker compose up -d --build backend`（仅 `--force-recreate` 不会加载新代码） |
-| Milvus 不可用 | `docker compose up -d` 后等 milvus healthy；可开 `http://localhost:8000`（Attu）看 collection/数据 |
-| 端口冲突 80/8080/3306/19530 | 改 `.env` 对应端口（compose 会引用），或停掉占用进程 |
+| Milvus 不可用 | 检查共享 infra 的 milvus 是否 healthy；可开 `http://localhost:38000`（Attu，共享 infra）看 collection/数据 |
+| 端口冲突 | 改 `.env` 对应端口（compose 会引用），或停掉占用进程 |
 | 上传的 `.doc` 不支持 | MinerU 不支持老版 `.doc`，先另存为 `.docx` 再上传 |
 | 本地解析太慢 | 大 PDF 可配置 `MINERU_API_TOKEN` 走官方 API（代价是文档内容上传云端） |
 | 检索结果异常 | 重跑 `python test-data/verify_old_data.py` 验证写入/检索链路；数据污染可重跑 `migrate_to_milvus.py` 幂等重灌 |

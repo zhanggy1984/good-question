@@ -140,6 +140,18 @@ def flush() -> None:
     _get_store().client.flush(COLLECTION_NAME)
 
 
+def ensure_loaded() -> None:
+    """启动时加载 rag_chunks collection：Milvus 重启后 collection 不自动 load，
+    不 load 时检索会报 "collection not loaded"。失败由调用方（lifespan）兜底告警。
+
+    collection 可能尚不存在（首启未上传任何文档），先 has_collection 探再 load。
+    """
+    client = _get_milvus_client()
+    if client.has_collection(COLLECTION_NAME):
+        client.load_collection(COLLECTION_NAME)
+        logger.info("[llama_store] Milvus collection 已加载: %s", COLLECTION_NAME)
+
+
 def chunk_to_node(chunk: dict, library_id: int, embedding: list[float]) -> TextNode:
     """chunk dict（{content, metadata}）→ TextNode
 

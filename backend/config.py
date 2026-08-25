@@ -3,8 +3,10 @@ from pydantic_settings import BaseSettings
 
 
 class Settings(BaseSettings):
-    # MySQL
-    mysql_root_password: str = "change_me"
+    # MySQL（共享 infra：用独立账号 native_rag_user，避免 root 跨库权限）
+    mysql_root_password: str = "change_me"   # 兼容保留，不再用于连接
+    mysql_user: str = "native_rag_user"
+    mysql_password: str = ""                 # 仅由环境变量 MYSQL_PASSWORD 注入（共享 infra 凭据不落代码）
     mysql_database: str = "native_rag"
     mysql_host: str = "mysql"
     mysql_port: int = 3306
@@ -25,7 +27,7 @@ class Settings(BaseSettings):
 
     # 聊天问答缓存（Redis）：相同问题 + 空上下文（新会话首句）命中时重放 SSE，省 DeepSeek 计费。
     # 文档更新后由 document_service 上传成功时清库缓存，TTL 兜底（默认 24h）。
-    redis_url: str = "redis://redis:6379/0"
+    redis_url: str = "redis://redis:6379/2"   # 共享 Redis db index 2（隔离规范）
     chat_cache_enabled: bool = True
     chat_cache_ttl_seconds: int = 86400
 
@@ -69,8 +71,12 @@ class Settings(BaseSettings):
     @property
     def database_url(self) -> str:
         """构建 SQLAlchemy 连接字符串"""
+        if not self.mysql_password:
+            raise RuntimeError(
+                "缺少 MYSQL_PASSWORD 环境变量（共享 infra MySQL 密码，见 .env.example）"
+            )
         return (
-            f"mysql+pymysql://root:{self.mysql_root_password}"
+            f"mysql+pymysql://{self.mysql_user}:{self.mysql_password}"
             f"@{self.mysql_host}:{self.mysql_port}/{self.mysql_database}"
             f"?charset=utf8mb4"
         )
