@@ -8,6 +8,7 @@ import json
 import sys
 
 import httpx
+import pytest
 
 sys.path.insert(0, "/app")
 
@@ -354,11 +355,24 @@ def test_knowledge_version_filters_by_library(monkeypatch):
     assert cs._knowledge_version(7) == ""
 
 
-def _stream_lines_resp(lines):
-    """把 SSE data 行包装成 _stream_deepseek 需要的 httpx 响应对象"""
+def _stream_lines_resp(lines, status_code=200):
+    """把 SSE data 行包装成 _stream_deepseek 需要的 httpx 响应对象
+
+    status_code 可指定非 2xx：_stream_deepseek 现做 resp.raise_for_status()，
+    fake 须提供 status_code 属性（默认 200 兼容既有用例）。
+    """
     class _Resp:
         def iter_lines(self):
             return iter(lines)
+
+        def raise_for_status(self):
+            # 镜像 httpx.Response.raise_for_status：非 2xx 抛 HTTPStatusError（供调用方 except）
+            if self.status_code >= 400:
+                raise httpx.HTTPStatusError(
+                    f"HTTP {self.status_code}", request=None, response=None)
+
+    # class 体内不构成闭包（class 作用域不捕获函数参数），须在类定义后经函数作用域赋值
+    _Resp.status_code = status_code
     class _Stream:
         def __enter__(self):
             return _Resp()
@@ -1069,3 +1083,56 @@ def test_contracts_manifest_endpoint():
     assert chat_iface["llm"] is True
     tags = {s["tag"] for s in data["scenes"]}
     assert {"greeting", "doc_qa", "no_hit", "summarize"} <= tags
+
+
+def test_stream_deepseek_http_error_raises(monkeypatch):
+    """_stream_deepseek：HTTP 非 2xx（401/429/500）显式抛异常，不再静默空返回（前端可见明确 error）"""
+    monkeypatch.setattr(httpx, "stream", lambda *a, **k: _stream_lines_resp([], status_code=401))
+    with pytest.raises(httpx.HTTPStatusError):
+        list(cs._stream_deepseek([{"role": "user", "content": "问题"}]))
+
+
+def test_stream_chat_first_round_error_yields_error_event(monkeypatch):
+    """LLM 第一轮抛异常（网络断/HTTP 错误）：yield error 事件、无 done（异常路径提前 return）"""
+    _patch_chat_pipeline(monkeypatch, round1=[{"type": "content", "content": "占位"}])
+
+    def _boom(messages, tools=None):
+        raise RuntimeError("LLM 调用失败")
+
+    monkeypatch.setattr(cs, "_stream_deepseek", _boom)
+    events = list(cs.stream_chat(1, "工资发放日是几号"))
+    types = [t for t, _ in events]
+    assert "error" in types, f"第一轮失败应产出 error 事件，实际 {types}"
+    assert "done" not in types, "error 后不应再有 done（异常路径提前 return）"
+    err = next(d for t, d in events if t == "error")
+    assert "LLM 调用失败" in err["message"]
+
+
+def test_stream_chat_empty_answer_fallback(monkeypatch):
+    """LLM 正常结束但零 content（只吐 usage）：兜底中性话术，且不写缓存（异常结果无缓存价值）"""
+    written = []
+    monkeypatch.setattr(cs.settings, "rule_override_enabled", False)  # 关 F3，让空返回落到收尾兜底
+    _patch_chat_pipeline(
+        monkeypatch,
+        round1=[{"type": "usage", "usage": {"prompt_tokens": 1, "completion_tokens": 0, "total_tokens": 1}}],
+    )
+    monkeypatch.setattr(cs, "set_cached", lambda *a, **k: written.append(a))
+    events = list(cs.stream_chat(1, "工资发放日是几号"))  # query 意图（非 smalltalk），缓存条件本会走到
+    types = [t for t, _ in events]
+    assert types == ["meta", "token", "usage", "done"], f"实际 {types}"
+    tok = next(d for t, d in events if t == "token")
+    assert tok["content"] == cs._EMPTY_ANSWER_FALLBACK
+    assert written == [], "LLM 空返回的兜底话术不应写缓存（empty_fallback 排除）"
+
+
+def test_stream_chat_empty_answer_fallback_smalltalk(monkeypatch):
+    """闲聊类空返回同样兜底（smalltalk，F3 天然不触发）：不再是空白气泡"""
+    _patch_chat_pipeline(
+        monkeypatch,
+        round1=[{"type": "usage", "usage": {"prompt_tokens": 1, "completion_tokens": 0, "total_tokens": 1}}],
+    )
+    events = list(cs.stream_chat(1, "你好"))
+    types = [t for t, _ in events]
+    assert types == ["meta", "token", "usage", "done"], f"实际 {types}"
+    tok = next(d for t, d in events if t == "token")
+    assert tok["content"] == cs._EMPTY_ANSWER_FALLBACK

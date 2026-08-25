@@ -26,10 +26,11 @@ class Settings(BaseSettings):
     deepseek_model: str = "deepseek-chat"
 
     # 聊天问答缓存（Redis）：相同问题 + 空上下文（新会话首句）命中时重放 SSE，省 DeepSeek 计费。
-    # 文档更新后由 document_service 上传成功时清库缓存，TTL 兜底（默认 24h）。
+    # 文档更新后由 document_service 上传成功时清库缓存，TTL 兜底（默认 2h——异常/旧答案
+    # 存活窗口不宜过长，文档频繁更新时 flush_library 即时清，TTL 只是最后兜底）。
     redis_url: str = "redis://redis:6379/2"   # 共享 Redis db index 2（隔离规范）
     chat_cache_enabled: bool = True
-    chat_cache_ttl_seconds: int = 86400
+    chat_cache_ttl_seconds: int = 7200
 
     # Embedding（默认与 .env.example 一致；换模型须保证向量维度与 Milvus collection 一致）
     embedding_model_name: str = "jinaai/jina-embeddings-v2-base-zh"

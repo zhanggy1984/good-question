@@ -12,7 +12,7 @@
   场景完全重叠，是同场景次优解。
 - 缓存是纯优化：Redis 连接失败/超时静默降级为无缓存，绝不影响主链路。
 - 答案绑定库（key 含 library_id）；文档更新后由 document_service 上传成功时
-  flush_library 清库缓存，TTL 兜底（默认 24h）。
+  flush_library 清库缓存，TTL 兜底（默认 2h）。
 - 命中时 usage 事件带 cached 标记，计费统计须排除命中请求，避免 token 虚高。
 """
 import hashlib

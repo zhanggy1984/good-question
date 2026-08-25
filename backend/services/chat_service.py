@@ -127,6 +127,11 @@ _RETRIEVAL_UNAVAILABLE_HINT = (
     "如果你不确定答案，请如实说明，不要编造。"
 )
 
+# LLM 空返回兜底话术：模型调用正常结束（或 HTTP 错误已被显式抛出）但 content 为空（只吐
+# reasoning / 流意外空）时，收尾处补一句中性话术——不编造内容，也不让前端出现空白气泡。
+# 中性措辞：空答案原因多样（模型异常/静默失败），不能装作已作答。
+_EMPTY_ANSWER_FALLBACK = "抱歉，模型没有生成有效回答，请稍后重试或换个问法。"
+
 # F3 否决豁免模式：明显无需查文档的通用问题（纯计算/当前时间/通用常识）——强制检索只会误伤，
 # 如"17×23 等于多少"被否决强制检索空后追加"未找到"，造成"先答再补未找到"的割裂体验（F3-1 实测）。
 # 命中即视为与文档库内容无关：跳过否决，docs 空兜底时也交 LLM 自然作答而非"未找到"。
@@ -623,6 +628,10 @@ def _stream_deepseek(messages: list[dict], tools: list[dict] | None = None):
         headers=headers,
         timeout=120,
     ) as resp:
+        # HTTP 错误显式化：非 2xx 响应体是 JSON 错误（非 SSE），若不检查会静默零 yield、
+        # 被当成"LLM 空返回"而空白收尾（实测 401/429 路径）。抛异常后由各调用点统一
+        # except 接住 → yield error 事件 → 前端明确提示（区别于静默空白）。
+        resp.raise_for_status()
         tool_acc: dict = {}  # index -> {"id", "name", "arguments"}；arguments 增量拼接
         for line in resp.iter_lines():
             if not line or not line.startswith("data:"):
@@ -793,6 +802,7 @@ def stream_chat(session_id: int, user_content: str):
         llm_rounds = 0
         usage_total = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
         retrieval_failed = False  # 检索服务不可用（Milvus 异常）：LLM 兜底回答且不写缓存
+        empty_fallback = False  # LLM 空返回兜底命中：补中性话术，不写缓存（异常结果无缓存价值）
         sources: list = []
         full_answer = ""
         full_reasoning = ""
@@ -1072,6 +1082,15 @@ def stream_chat(session_id: int, user_content: str):
             duration_ms=int((time.time() - t_start) * 1000),
         )
 
+        # 4.5 LLM 空返回兜底：走到此处必未发过 error（异常路径已提前 return），但 LLM 可能
+        # 正常结束却零 content（只吐 reasoning / 静默失败）。空答案落库会让前端空白气泡，
+        # 补一条中性话术（不编造内容）；empty_fallback 标记使其不写缓存（异常结果无缓存价值）。
+        if not full_answer:
+            full_answer = _EMPTY_ANSWER_FALLBACK
+            empty_fallback = True
+            logger.warning("[chat] LLM 未产出有效回答，兜底话术 session=%s", session_id)
+            yield ("token", {"content": full_answer, "delta": full_answer, "ts": _ts()})
+
         # 5. usage（多轮合并为一个）+ 写缓存 + 保存消息 + 记忆压缩
         yield ("usage", {**usage_total, "ts": _ts()})
 
@@ -1079,7 +1098,7 @@ def stream_chat(session_id: int, user_content: str):
         # 检索空/低分的固定话术同样写：命中后直接重放"未找到"，不再查 Milvus（省检索耗时），
         # 文档更新后 flush_library 清库，未找到缓存不会长期误导。检索失败（Milvus 不可用）
         # 的 LLM 兜底不写（retrieval_failed：无文档依据，且 Milvus 恢复后应重新检索）。
-        if cache_state == "miss" and llm_rounds > 0 and not _is_smalltalk(user_content) and not retrieval_failed:
+        if cache_state == "miss" and llm_rounds > 0 and not _is_smalltalk(user_content) and not retrieval_failed and not empty_fallback:
             set_cached(session.library_id, user_content, {
                 "decided_retrieve": decided_retrieve,
                 "rule_override": rule_override,
