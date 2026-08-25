@@ -22,7 +22,7 @@ def req(method, path, auth=None, data=None, timeout=120):
 auth = json.loads(req("POST", "/api/auth/login", data={"username": USER, "password": PASS}).read())["access_token"]
 print("[1] 登录 OK")
 
-# 动态取第一个库（演示/历史库 id 会随重建变化，硬编码 id=1 已失效）
+# 动态取第一个库（示例/历史库 id 会随重建变化，硬编码 id=1 已失效）
 libs = json.loads(req("GET", "/api/libraries", auth=auth).read()).get("items") or []
 assert libs, "无可用文档库，请先建库"
 lib_id = libs[0]["id"]

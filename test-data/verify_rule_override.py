@@ -56,7 +56,7 @@ def chat_sse(auth, sid, content):
 auth = json.loads(req("POST", "/api/auth/login", data={"username": USER, "password": PASS}).read())["access_token"]
 libs = json.loads(req("GET", "/api/libraries", auth=auth).read()).get("items") or []
 assert libs, "无可用文档库"
-lib = next((x for x in libs if x.get("name") == "演示知识库"), libs[0])
+lib = next((x for x in libs if x.get("name") == "示例知识库"), libs[0])
 sid = json.loads(req("POST", "/api/sessions", auth=auth, data={"library_id": lib["id"]}).read())["id"]
 print(f"新会话 sid={sid}（文档库「{lib.get('name')}」）\n")
 

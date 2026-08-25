@@ -75,8 +75,8 @@ def mysql_summary(sid):
 auth = json.loads(req("POST", "/api/auth/login", data={"username": USER, "password": PASS}).read())["access_token"]
 libs = json.loads(req("GET", "/api/libraries", auth=auth).read()).get("items") or []
 assert libs, "无可用文档库"
-# 优先选"演示知识库"（含员工考勤管理制度.md，实质问题可命中）；libs[0] 未必是它
-lib = next((x for x in libs if x.get("name") == "演示知识库"), libs[0])
+# 优先选"示例知识库"（含员工考勤管理制度.md，实质问题可命中）；libs[0] 未必是它
+lib = next((x for x in libs if x.get("name") == "示例知识库"), libs[0])
 lib_id = lib["id"]
 sid = json.loads(req("POST", "/api/sessions", auth=auth, data={"library_id": lib_id}).read())["id"]
 print(f"新会话 sid={sid}（文档库 {lib_id}「{lib.get('name')}」）\n")

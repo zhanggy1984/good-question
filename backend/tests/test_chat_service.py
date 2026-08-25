@@ -782,7 +782,7 @@ def test_is_non_doc_question():
     assert cs._is_non_doc_question("今天是星期几")
     assert cs._is_non_doc_question("今天天气怎么样")
     assert cs._is_non_doc_question("圆周率是多少")
-    # 文档类（演示库考勤/工资），不应豁免
+    # 文档类（示例库考勤/工资），不应豁免
     assert not cs._is_non_doc_question("工资发放日是几号")
     assert not cs._is_non_doc_question("请事假需要提前几天申请")
     assert not cs._is_non_doc_question("加班费怎么算")

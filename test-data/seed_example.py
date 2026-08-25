@@ -1,13 +1,13 @@
 # -*- coding: utf-8 -*-
-"""一键生成演示数据：登录 → 重建"演示知识库" → 上传 4 份演示文档 → 轮询就绪 → 打印场景问题清单
+"""一键生成示例数据：登录 → 重建"示例知识库" → 上传 4 份示例文档 → 轮询就绪 → 打印场景问题清单
 
-幂等可重跑：每次运行会删除已存在的"演示知识库"并重建（chat_sessions/documents/chunks 外键
+幂等可重跑：每次运行会删除已存在的"示例知识库"并重建（chat_sessions/documents/chunks 外键
 CASCADE 级联清理，Milvus 库 partition 一并删除），保证客观可复现。
 
-演示文档用 .md（抽取走明文读取，无需 MinerU），只需 MySQL + Milvus + backend 容器。
+示例文档用 .md（抽取走明文读取，无需 MinerU），只需 MySQL + Milvus + backend 容器。
 
 运行（需服务已启动，对 http://localhost）：
-    python test-data/seed_demo.py
+    python test-data/seed_example.py
 
 凭据从环境变量读取（默认 admin/admin123），避免脚本内硬编码：
     RAG_ADMIN_USER / RAG_ADMIN_PASS
@@ -22,10 +22,10 @@ import uuid
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")  # 统一 UTF-8，避免 Windows 控制台 GBK 乱码
 
 BASE = "http://localhost"
-LIB_NAME = "演示知识库"
+LIB_NAME = "示例知识库"
 
-# 演示文档：与 README"八、演示场景"一一对应，文件名即上传后的文档名
-DEMO_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "demo")
+# 示例文档：与 README"八、示例场景"一一对应，文件名即上传后的文档名
+EXAMPLES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "examples")
 DEMO_DOCS = [
     "员工考勤管理制度.md",
     "Docker环境安装部署手册.md",
@@ -33,7 +33,7 @@ DEMO_DOCS = [
     "客户数据保密协议.md",
 ]
 
-# 场景问题清单（照 README 演示场景设计，供复制到前端聊天页提问）
+# 场景问题清单（照 README 示例场景设计，供复制到前端聊天页提问）
 SCENARIOS = [
     ("场景 1 · 事实问答", "公司规定请事假需要提前几天申请？",
      "答案命中考勤制度，带 [来源N] 引用；溯源卡片显示“员工考勤管理制度 > 请假管理”标题路径"),
@@ -101,7 +101,7 @@ def login():
 
 
 def reset_library(auth):
-    """幂等清理：删除已存在的“演示知识库”（外键 CASCADE 级联清理会话/文档/向量）"""
+    """幂等清理：删除已存在的“示例知识库”（外键 CASCADE 级联清理会话/文档/向量）"""
     code, raw = req("GET", "/api/libraries?page=1&page_size=100", auth=auth)
     libs = json.loads(raw).get("items") or []
     old = [lb for lb in libs if lb["name"] == LIB_NAME]
@@ -109,13 +109,13 @@ def reset_library(auth):
         code, _ = req("DELETE", f"/api/libraries/{lb['id']}", auth=auth)
         print(f"[2] 删除旧库 id={lb['id']}（{lb['name']}），status={code}")
     if not old:
-        print("[2] 无旧演示库，直接新建")
+        print("[2] 无旧示例库，直接新建")
 
 
 def create_library(auth):
-    """创建演示库并返回 library_id"""
+    """创建示例库并返回 library_id"""
     code, raw = req("POST", "/api/libraries", auth=auth,
-                    data={"name": LIB_NAME, "description": "一键演示数据：4 份中文文档，支撑 6 个演示场景"})
+                    data={"name": LIB_NAME, "description": "一键示例数据：4 份中文文档，支撑 6 个示例场景"})
     if code != 201:
         print(f"!! 建库失败（{code}）: {raw[:300]}", file=sys.stderr)
         sys.exit(1)
@@ -125,12 +125,12 @@ def create_library(auth):
 
 
 def upload_docs(auth, library_id):
-    """逐个上传演示文档，返回 {文件名: 文档id}"""
+    """逐个上传示例文档，返回 {文件名: 文档id}"""
     doc_ids = {}
     for name in DEMO_DOCS:
-        path = os.path.join(DEMO_DIR, name)
+        path = os.path.join(EXAMPLES_DIR, name)
         if not os.path.exists(path):
-            print(f"!! 演示文档缺失: {path}", file=sys.stderr)
+            print(f"!! 示例文档缺失: {path}", file=sys.stderr)
             sys.exit(1)
         code, raw = req("POST", f"/api/libraries/{library_id}/documents", auth=auth, files=path)
         if code != 201:
@@ -165,10 +165,10 @@ def wait_ready(auth, doc_ids):
 
 
 def print_scenarios():
-    """打印演示场景问题清单（复制到前端聊天页提问）"""
+    """打印示例场景问题清单（复制到前端聊天页提问）"""
     print("\n" + "=" * 68)
-    print("演示就绪。请在浏览器打开 http://localhost，以 admin 登录，")
-    print("进入“聊天问答”选择文档库【演示知识库】，新建会话后复制以下问题提问：")
+    print("示例就绪。请在浏览器打开 http://localhost，以 admin 登录，")
+    print("进入“聊天问答”选择文档库【示例知识库】，新建会话后复制以下问题提问：")
     print("=" * 68)
     for title, question, expect in SCENARIOS:
         print(f"\n{title}")

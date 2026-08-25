@@ -19,7 +19,7 @@
   字段名 sparse_embedding 由 MilvusVectorStore 硬编码；dense 索引用 HNSW/IP。
 - 旧 collection（服务端 BM25 + pk 主键 + enable_dynamic_field=False）schema 不兼容，
   _get_store 检测到缺 sparse_embedding 字段即 drop，由 LlamaIndex 重建（数据可从
-  MySQL 重灌，演示项目无丢失）。
+  MySQL 重灌，示例项目无丢失）。
 """
 import asyncio
 import logging

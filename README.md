@@ -2,7 +2,7 @@
 
 > **多用户 RAG 文档问答系统**：文档上传即自动抽取 → 清洗 → 切片 → 向量化，之后基于文档库提问，大模型用**带来源标注、流式返回**的答案作答。私有知识有出处、可溯源、不编造，会话与文档库双隔离。
 
-本系统是**契约对齐的 RAG 演示项目**：7 服务一键启动、nginx 80 端口为唯一入口、LlamaIndex 统一混合检索（dense + BGE-M3 稀疏 + RRF 融合 + Rerank 精排）、function calling 编排（LLM 自主决定是否检索）+ 规则否决权（F3：该查不查时强制检索）+ 纯计算/常识豁免 + 两级置信档防幻觉、SSE 事件流对齐评测契约 v1.0（`meta`/`tool_call`/`usage` + 全事件 `ts`）、Redis 问答缓存命中重放、134 项单元测试 + 契约运行时验证脚本开箱即用。
+本系统是**契约对齐的 RAG 文档问答系统**：7 服务一键启动、nginx 80 端口为唯一入口、LlamaIndex 统一混合检索（dense + BGE-M3 稀疏 + RRF 融合 + Rerank 精排）、function calling 编排（LLM 自主决定是否检索）+ 规则否决权（F3：该查不查时强制检索）+ 纯计算/常识豁免 + 两级置信档防幻觉、SSE 事件流对齐评测契约 v1.0（`meta`/`tool_call`/`usage` + 全事件 `ts`）、Redis 问答缓存命中重放、134 项单元测试 + 契约运行时验证脚本开箱即用。
 
 ---
 
@@ -15,7 +15,7 @@
 - [五、技术栈一览](#五技术栈一览)
 - [六、快速开始（3 步跑起来）](#六快速开始3-步跑起来)
 - [七、配置说明](#七配置说明)
-- [八、演示场景（一键造数）](#八演示场景一键造数)
+- [八、示例场景（一键造数）](#八示例场景一键造数)
 - [九、目录结构](#九目录结构)
 - [十、测试与验收](#十测试与验收)
 - [十一、开发指南](#十一开发指南)
@@ -270,23 +270,23 @@ open http://localhost:8000     # Attu：Milvus 可视化管理 UI
 
 ---
 
-## 八、演示场景（一键造数）
+## 八、示例场景（一键造数）
 
-> 演示数据**客观可复现**：`test-data/seed_demo.py` 一键重建"演示知识库"（删旧库 → 上传 4 份中文文档 → 等就绪 → 打印问题清单）。演示文档用 `.md`（抽取走明文读取，无需 MinerU），容器就绪即可秒级造数。
+> 示例数据**客观可复现**：`test-data/seed_example.py` 一键重建"示例知识库"（删旧库 → 上传 4 份中文文档 → 等就绪 → 打印问题清单）。示例文档用 `.md`（抽取走明文读取，无需 MinerU），容器就绪即可秒级造数。
 
 ### 一键造数
 
 ```bash
 docker compose up -d                   # 7 服务就绪（首次构建较久）
-python test-data/seed_demo.py          # 登录 → 重建演示库 → 上传 4 份文档 → 等就绪 → 打印问题清单
-open http://localhost                   # admin 登录 → 聊天页选"演示知识库" → 复制场景问题提问
+python test-data/seed_example.py          # 登录 → 重建示例库 → 上传 4 份文档 → 等就绪 → 打印问题清单
+open http://localhost                   # admin 登录 → 聊天页选"示例知识库" → 复制场景问题提问
 ```
 
-幂等可重跑：重复执行会删除已存在的演示库并重建（会话/文档/向量级联清理），结果一致。
+幂等可重跑：重复执行会删除已存在的示例库并重建（会话/文档/向量级联清理），结果一致。
 
-> ⚠️ 演示/验证脚本默认以 `admin / admin123` 登录（`config.py` 默认值）；若已修改 `ADMIN_PASSWORD`，请用环境变量 `RAG_ADMIN_USER` / `RAG_ADMIN_PASS` 覆盖后运行。
+> ⚠️ 示例/验证脚本默认以 `admin / admin123` 登录（`config.py` 默认值）；若已修改 `ADMIN_PASSWORD`，请用环境变量 `RAG_ADMIN_USER` / `RAG_ADMIN_PASS` 覆盖后运行。
 
-### 6 个演示场景
+### 6 个示例场景
 
 | 场景 | 提问（复制即用） | 预期 | 观看点 |
 |------|------------------|------|--------|
@@ -299,16 +299,16 @@ open http://localhost                   # admin 登录 → 聊天页选"演示�
 
 ### 评测场景（契约声明）
 
-`GET /api/contracts` 声明的 4 个评测场景是**行为契约**（平台据此出题），与上述业务演示一一对应：
+`GET /api/contracts` 声明的 4 个评测场景是**行为契约**（平台据此出题），与上述业务示例一一对应：
 
-| 契约标签 | 对应演示 |
+| 契约标签 | 对应示例 |
 |---------|---------|
 | `greeting` 问候闲聊 | 场景 5 |
 | `doc_qa` 文档检索问答 | 场景 1 / 2 / 6 |
 | `no_hit` 无命中兜底 | 场景 3 |
 | `summarize` 文档总结 | 场景 4 |
 
-**验收演示**（对运行中的服务）：
+**验收示例**（对运行中的服务）：
 
 ```bash
 python verify_contract.py           # 契约事件流验证（meta → reasoning/token → [tool_call → sources]? → usage → done）
@@ -355,7 +355,7 @@ good-question/
 │       ├── views/            # 7 个页面（登录/注册/仪表盘/文档库/文档/chunk详情/聊天）
 │       ├── components/       # 布局 + 溯源卡片 + 会话列表等
 │       └── utils/sse.ts      # SSE 流式接收（解析 event/data 块）
-├── test-data/                # seed_demo.py（一键演示数据）+ demo/（4 份演示文档）
+├── test-data/                # seed_example.py（一键示例数据）+ examples/（4 份示例文档）
 │                             # + 验证脚本（e2e / chat / verify_old_data / verify_classifier /
 │                             #   verify_memory_compress / verify_rule_override）+ 验证文档
 └── data/                     # 上传文件存储（uploads/）
@@ -474,7 +474,7 @@ python verify_contract.py                                          # 宿主机�
    - **离线入库代价**：BGE-M3 学习稀疏编码 CPU 每批 64 条约 3.5 分钟，大批量重灌（migrate）耗时以十分钟计——这是从服务端 BM25 迁移到学习稀疏的固有性能代价（换 GPU 推理可缓解）。
    - 可选方向：GPU 推理、更小的 rerank 模型、或更激进的候选控制（均已评估，各有取舍，尚未落地）。
 2. **模型全 CPU 推理**：embedding、稀疏编码与 rerank 均为 CPU，重负载场景可考虑 GPU 容器。
-3. **无 LLM 缓存**：相同的问与答会重复调用 DeepSeek（计费）。高频率场景可加缓存层。
+3. **问答缓存仅精确命中**：Redis 缓存 key 为"库 + 模型 + 问题"，仅完全一致的问题命中并重放；语义相近或带多轮上下文变体的问题会走完整调用（DeepSeek 计费）。高频率场景可评估语义级缓存。
 
 ---
 
@@ -495,5 +495,5 @@ python verify_contract.py                                          # 宿主机�
 - **PRD 需求**：[prd.txt](prd.txt)（原始功能需求）
 - **技术方案**：[solution.md](solution.md)（v2 归档存根；检索层已演进为 LlamaIndex + Milvus，实现细节以本 README 四/五章为准）
 - **SSE 契约验证**：[verify_contract.py](verify_contract.py)（契约事件流运行时断言）
-- **一键演示数据**：[test-data/seed_demo.py](test-data/seed_demo.py)（重建"演示知识库"并打印 6 个场景问题清单）
+- **一键示例数据**：[test-data/seed_example.py](test-data/seed_example.py)（重建"示例知识库"并打印 6 个场景问题清单）
 - **Milvus 迁移配套**：[backend/scripts/migrate_to_milvus.py](backend/scripts/migrate_to_milvus.py)、[test-data/](test-data/)（e2e / chat / verify_old_data + 升级验证文档）
