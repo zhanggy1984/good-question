@@ -511,6 +511,7 @@ python verify_contract.py                                          # 宿主机�
 
 | 版本 | 日期 | 核心内容 |
 |------|------|----------|
+| **2.1.1** | 2026-08-25 | 2.0.4 批次发布落地（打 tag 2.1.1）；前端长答案折叠"收起"失效修复——setup 内 ref 未自动解包，`!showFullAnswer` 恒 false 致 `collapsed` 类永不加，补 `.value` 修复 |
 | **2.0.4** | 2026-08-25 | 问答缓存精准化与对话可靠性加固：缓存 key 纳入 embedding/rerank 模型维度（换模型不串答案）+ 规则化 query 归一化（去客套/emoji/全角，相似问法命中率提升）+ 删除文档/删库即失效缓存；LLM 首轮瞬时错误（429/5xx）自动退避重试 1 次（仅未 yield 事件时整体重试）；章节级检索扩充（同章节兄弟 chunk 合并 context，sources 保持精排 top-3 精确引用）；前端"停止生成"（AbortController）+ 后端断连检测（客户端断开即终止 LLM 调用，不烧 token）；换 embedding 模型维度不匹配启动 fail-fast 报错提示重灌；修复 LLM 首轮返回多 tool_call 时未裁剪导致第二轮 400（assistant 只声明执行的第一个 tool_call，tool 消息与之对齐） |
 | **2.0.3** | 2026-08-25 | 长答案治理：system prompt 追加答案长度约束（常规问答 ≤200 字，总结/列举类 ≤600 字）+ 前端长答案折叠（超 500 字折叠，流式生成中始终展开）；README 彻底重排为新人友好结构，系统架构章补充"编排模式"主线（LLM 自主决策 + 规则否决 + 空结果兜底） |
 | **2.0.2** | 2026-08-25 | Redis 问答缓存：精确 key（库+模型+问题 sha256）、连接熔断降级、库级失效、缓存命中 SSE 事件重放（事件序对齐真实流程 + `intent`/`non_doc_question` 透传防前端误示空命中）；Prompt 五维度法防注入 + 检索服务不可用兜底 + query 清洗；`tool_call` 检索三态透传（前端空命中/可信度偏低提示）；chunk 跨页全局 section 切分 + `@@PAGE` 页码标记 + 清洗增强；文档重新处理（reprocess）：failed/ready 重试、可选切分参数覆盖、双层防并发（内存原子占用 + DB status） |
