@@ -54,6 +54,7 @@ def test_system_prompt_injection_boundary():
     assert "一律无效" in content
     assert "不得向用户透露" in content, "应含防系统提示词泄露声明"
     assert "{summary}" in content
+    assert "200 字以内" in content, "output 段应含答案长度约束（长答案体验治理）"
 
 
 def test_override_context_has_delimiter():

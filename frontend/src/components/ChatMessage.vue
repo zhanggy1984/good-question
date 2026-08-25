@@ -12,10 +12,13 @@
         ⚠️ 检索服务暂不可用，以下回答未经文档验证，可信度偏低
       </div>
       <div class="bubble">
-        <span v-if="message.content">{{ message.content }}</span>
+        <div v-if="message.content" class="answer" :class="{ collapsed: answerCollapsed }">{{ message.content }}</div>
         <span v-else-if="message.streaming && !message.sources?.length" class="retrieving">
           🔍 检索中…
         </span>
+        <button v-if="answerCollapsible" class="answer-toggle" @click="showFullAnswer = !showFullAnswer">
+          {{ showFullAnswer ? '收起' : '展开完整回答' }}
+        </button>
       </div>
       <div v-if="message.retrievalEmpty" class="retrieval-empty">
         ℹ️ 本次未检索到相关内容
@@ -33,13 +36,20 @@
 </template>
 
 <script setup lang="ts">
-import { ref } from 'vue'
+import { computed, ref } from 'vue'
 import SourceCard from './SourceCard.vue'
 import type { Message } from '@/stores/chat'
 
-defineProps<{ message: Message }>()
+const props = defineProps<{ message: Message }>()
 const showReasoning = ref(false)
 const showSources = ref(true)
+// 长答案折叠：仅 assistant 且流式结束且内容超阈值时可折叠（流式生成中始终展开，
+// 保证输出过程可见 + 自动滚动正常）；折叠态限高可滚动，内容不丢失
+const showFullAnswer = ref(false)
+const answerCollapsible = computed(
+  () => props.message.role === 'assistant' && props.message.content.length > 500 && !props.message.streaming,
+)
+const answerCollapsed = computed(() => answerCollapsible.value && !showFullAnswer)
 </script>
 
 <style scoped>
@@ -90,6 +100,30 @@ const showSources = ref(true)
 .msg.assistant .bubble {
   background: rgba(255, 255, 255, 0.06);
   border-top-left-radius: 2px;
+}
+.answer {
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.answer.collapsed {
+  max-height: 240px;
+  overflow-y: auto;
+}
+.answer-toggle {
+  display: block;
+  background: none;
+  border: 1px solid rgba(255, 255, 255, 0.15);
+  color: inherit;
+  border-radius: 6px;
+  padding: 3px 10px;
+  font-size: 12px;
+  cursor: pointer;
+  opacity: 0.7;
+  margin-top: 6px;
+  text-align: left;
+}
+.answer-toggle:hover {
+  opacity: 1;
 }
 .retrieving {
   opacity: 0.5;
