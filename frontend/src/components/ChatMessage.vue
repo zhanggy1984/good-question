@@ -49,7 +49,7 @@ const showFullAnswer = ref(false)
 const answerCollapsible = computed(
   () => props.message.role === 'assistant' && props.message.content.length > 500 && !props.message.streaming,
 )
-const answerCollapsed = computed(() => answerCollapsible.value && !showFullAnswer)
+const answerCollapsed = computed(() => answerCollapsible.value && !showFullAnswer.value)
 </script>
 
 <style scoped>
