@@ -55,14 +55,22 @@ def _payload(**overrides):
 
 def test_key_stable_and_library_isolated(monkeypatch):
     monkeypatch.setattr(cc.settings, "deepseek_model", "deepseek-chat")
+    monkeypatch.setattr(cc.settings, "embedding_model_name", "embed-a")
+    monkeypatch.setattr(cc.settings, "rerank_model_name", "rerank-a")
     k1 = cc._key(7, "工资几号发")
     assert cc._key(7, "工资几号发") == k1          # 同库同问题 → 同 key
     assert cc._key(8, "工资几号发") != k1          # 不同库 → 隔离
     assert cc._key(7, " 工资几号发 ") == k1        # 首尾空白归一，不影响命中
     assert k1.startswith("goodq:chat:7:")
-    # 换模型 → key 变，旧模型缓存自然失效（config 支持只改 DEEPSEEK_MODEL 切换）
-    monkeypatch.setattr(cc.settings, "deepseek_model", "deepseek-v4-pro")
-    assert cc._key(7, "工资几号发") != k1
+    # 任一模型切换 → key 变，旧答案不可复用：答案 = LLM 生成 + 检索（embedding 召回 +
+    # rerank 精排）三方共同决定，只含 LLM 模型时换向量模型不触发失效，旧答案会误导
+    for attr, val in (
+        ("deepseek_model", "deepseek-v4-pro"),
+        ("embedding_model_name", "embed-b"),
+        ("rerank_model_name", "rerank-b"),
+    ):
+        monkeypatch.setattr(cc.settings, attr, val)
+        assert cc._key(7, "工资几号发") != k1, f"换 {attr} 后 key 应变化"
 
 
 def test_set_get_roundtrip(monkeypatch):

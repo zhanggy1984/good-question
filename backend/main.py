@@ -44,10 +44,19 @@ async def lifespan(app: FastAPI):
         logger.warning("[lifespan] 模型预热失败（不影响启动）: %s", e)
 
     # 加载 Milvus collection（rag_chunks）：Milvus 重启后 collection 不自动 load，
-    # 不 load 检索会报错。失败仅告警，不影响启动。
+    # 不 load 检索会报错。维度校验失败（换 embedding 模型）强制停机提示重灌——
+    # 维度不匹配到插入/检索时才炸难以排查，必须 fail-fast；其他失败仅告警，不影响启动。
     try:
-        from services.llama_store import ensure_loaded
+        from services.llama_store import (
+            EmbeddingDimensionMismatchError,
+            ensure_dimension_match,
+            ensure_loaded,
+        )
+        ensure_dimension_match()
         ensure_loaded()
+    except EmbeddingDimensionMismatchError as e:
+        logger.error("[lifespan] %s", e)
+        raise  # 维度不匹配必须停机重灌，不静默降级
     except Exception as e:
         logger.warning("[lifespan] Milvus collection 加载失败（不影响启动）: %s", e)
 

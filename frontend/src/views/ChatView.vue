@@ -40,7 +40,12 @@
             <n-button size="tiny" type="warning" @click="retryLast">重试</n-button>
           </div>
         </div>
-        <ChatInput :disabled="chat.streaming" @send="send" />
+        <div class="chat-footer">
+          <ChatInput :disabled="chat.streaming" @send="send" />
+          <n-button v-if="chat.streaming" size="small" type="warning" @click="stop">
+            停止生成
+          </n-button>
+        </div>
       </template>
     </div>
   </div>
@@ -75,6 +80,7 @@ const msgRef = ref<HTMLElement>()
 const libraries = ref<Library[]>([])
 const selectedLibrary = ref<number | null>(null)
 const sessions = ref<ChatSession[]>([])
+const stopController = ref<AbortController | null>(null)
 
 const libraryOptions = computed(() =>
   libraries.value.map((l) => ({ label: l.name, value: l.id })),
@@ -188,6 +194,11 @@ async function send(content: string) {
   chat.setStreaming(true)
   scrollBottom()
 
+  // 停止生成：本轮的 AbortController，停止按钮触发 abort → 终止请求与后端 LLM 调用
+  const controller = new AbortController()
+  stopController.value = controller
+  let completed = false
+
   try {
     await streamChat(sid as number, content, auth.token, (ev) => {
       if (ev.type === 'tool_call') {
@@ -214,20 +225,35 @@ async function send(content: string) {
         chat.appendToken(ev.data.content)
         scrollBottom()
       } else if (ev.type === 'done') {
+        completed = true
         chat.finishAssistantMessage()
         chat.setStreaming(false)
         scrollBottom()
       } else if (ev.type === 'error') {
+        completed = true
         chat.setError(ev.data.message)
         chat.finishAssistantMessage()
         chat.setStreaming(false)
       }
-    })
+    }, controller.signal)
+    // 走到这里而 completed 仍 false：用户点了停止生成（streamChat 正常返回）——
+    // 保留已生成的部分内容，仅结束流式状态，不弹错误
+    if (!completed) {
+      chat.finishAssistantMessage()
+      chat.setStreaming(false)
+    }
   } catch (e: any) {
     chat.setError(e.message || '连接中断')
     chat.finishAssistantMessage()
     chat.setStreaming(false)
+  } finally {
+    stopController.value = null
   }
+}
+
+// 停止生成：中止本轮 SSE 请求（后端断连检测会随之终止 LLM 调用）
+function stop() {
+  stopController.value?.abort()
 }
 
 // 重试：重新发送最后一条用户消息
@@ -312,4 +338,14 @@ function scrollBottom() {
   color: #d03050;
   font-size: 13px;
 }
+.chat-footer {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex: none;
+}
+.chat-footer :deep(.chat-input) {
+  flex: 1;
+}
+
 </style>

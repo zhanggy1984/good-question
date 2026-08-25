@@ -5,6 +5,8 @@ ref_doc_id=document_id（delete_by_document 语义不变）、library_id 注入 
 """
 import sys
 
+import pytest
+
 sys.path.insert(0, "/app")
 
 from services import llama_store  # noqa: E402
@@ -127,3 +129,58 @@ def test_ensure_loaded_loads_existing_collection(monkeypatch):
     llama_store.ensure_loaded()
     assert fake.loaded is True
     assert fake.loaded_name == llama_store.COLLECTION_NAME
+
+
+# ════════ #9 embedding 维度 fail-fast 校验（换模型后旧 collection 维度不匹配提前报错）════════
+
+
+def test_raise_on_dim_mismatch_raises():
+    """dense 维度与当前模型输出不一致：抛 EmbeddingDimensionMismatchError，错误信息含两侧维度"""
+    fields = [
+        {"name": "dense", "params": {"dim": 1024}},
+        {"name": "sparse_embedding", "params": {}},
+    ]
+    with pytest.raises(llama_store.EmbeddingDimensionMismatchError) as ei:
+        llama_store._raise_on_dim_mismatch(fields, 768)
+    assert "1024" in str(ei.value) and "768" in str(ei.value)
+
+
+def test_raise_on_dim_mismatch_passes():
+    """dense 维度与模型一致：不抛"""
+    llama_store._raise_on_dim_mismatch([{"name": "dense", "params": {"dim": 768}}], 768)
+
+
+def test_raise_on_dim_mismatch_missing_dense_ignored():
+    """schema 无 dense 字段（异常/不完整 schema）：静默通过，不误抛"""
+    llama_store._raise_on_dim_mismatch([{"name": "pk", "params": {}}], 768)
+
+
+def test_ensure_dimension_match_fails_fast_on_mismatch(monkeypatch):
+    """启动校验：collection 存在 + 维度不一致 → fail-fast 抛错（不做静默 drop，丢向量需用户决定）"""
+    class _FakeClient:
+        def has_collection(self, name):
+            return True
+
+        def describe_collection(self, name):
+            return {"fields": [
+                {"name": "dense", "params": {"dim": 1024}},
+                {"name": "sparse_embedding", "params": {}},
+            ]}
+
+    monkeypatch.setattr(llama_store, "_get_milvus_client", lambda: _FakeClient())
+    monkeypatch.setattr(llama_store, "embed_texts", lambda texts: [[0.0] * 768])
+    with pytest.raises(llama_store.EmbeddingDimensionMismatchError):
+        llama_store.ensure_dimension_match()
+
+
+def test_ensure_dimension_match_skips_missing_collection(monkeypatch):
+    """collection 不存在（首启未上传文档）：跳过校验不抛错"""
+    class _FakeClient:
+        def has_collection(self, name):
+            return False
+
+        def describe_collection(self, name):
+            raise AssertionError("collection 不存在不应执行 describe")
+
+    monkeypatch.setattr(llama_store, "_get_milvus_client", lambda: _FakeClient())
+    llama_store.ensure_dimension_match()  # 不抛即通过

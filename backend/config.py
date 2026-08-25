@@ -24,6 +24,12 @@ class Settings(BaseSettings):
     deepseek_api_key: str = "sk-xxx"
     deepseek_base_url: str = "https://api.deepseek.com/v1"
     deepseek_model: str = "deepseek-chat"
+    # 首轮 LLM 瞬时错误（429/5xx）重试：仅限首轮且未流出任何事件时整体重试（可用性提升）；
+    # 第二轮失败时首轮事件已发出，无法整体重试，直接报错（不在此列）。
+    # chat_llm_max_attempts 是"总调用次数上限（含首次）"：默认 2 = 首次失败后重试 1 次。
+    # 每次重试都是完整付费调用，配置勿设过大（瞬时错误多为 429/5xx，退避后重试即恢复）。
+    chat_llm_max_attempts: int = 2
+    chat_llm_retry_backoff_seconds: float = 0.5
 
     # 聊天问答缓存（Redis）：相同问题 + 空上下文（新会话首句）命中时重放 SSE，省 DeepSeek 计费。
     # 文档更新后由 document_service 上传成功时清库缓存，TTL 兜底（默认 2h——异常/旧答案

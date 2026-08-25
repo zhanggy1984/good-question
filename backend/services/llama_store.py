@@ -39,6 +39,10 @@ logger = logging.getLogger("native_rag")
 COLLECTION_NAME = "rag_chunks"
 
 
+class EmbeddingDimensionMismatchError(RuntimeError):
+    """换 embedding 模型后 dense 维度与 Milvus collection 不一致（fail-fast，提示重灌）"""
+
+
 def _ensure_event_loop() -> None:
     """确保当前线程存在 asyncio 事件循环
 
@@ -71,6 +75,25 @@ _store_lock = threading.Lock()
 _cached_store: MilvusVectorStore | None = None
 
 
+def _raise_on_dim_mismatch(fields: list, model_dim: int) -> None:
+    """dense 字段维度 vs 模型维度：不一致抛 EmbeddingDimensionMismatchError（fail-fast）
+
+    换 embedding 模型后旧 collection 维度不变，到 Milvus 插入/检索时才炸且错误难排查
+    （插入发生在文档处理后台线程）。启动/首访即比对，给出明确重灌提示；不做静默 drop
+    （丢已有向量），提示重灌路径由用户决定。
+    """
+    for f in fields:
+        if f.get("name") == "dense":
+            stored = f.get("params", {}).get("dim")
+            if stored is not None and stored != model_dim:
+                raise EmbeddingDimensionMismatchError(
+                    f"embedding 模型维度不匹配：collection dense 维度={stored}，"
+                    f"当前模型({settings.embedding_model_name})输出={model_dim}。"
+                    f"换模型后需重灌向量：删除 collection {COLLECTION_NAME} 重建并重跑文档处理。"
+                )
+            return
+
+
 def _build_store() -> MilvusVectorStore:
     """实际构造 MilvusVectorStore（仅首次由 _get_store 锁保护下调用）
 
@@ -79,6 +102,8 @@ def _build_store() -> MilvusVectorStore:
     """
     _ensure_event_loop()
     client = _get_milvus_client()
+    # dense 维度取自 embedding 模型实际输出，避免与配置漂移
+    dim = len(embed_texts(["维度探测"])[0])
     if client.has_collection(COLLECTION_NAME):
         schema = client.describe_collection(COLLECTION_NAME)
         fields = [f["name"] for f in schema.get("fields", [])]
@@ -88,8 +113,9 @@ def _build_store() -> MilvusVectorStore:
                 COLLECTION_NAME,
             )
             client.drop_collection(COLLECTION_NAME)
-    # dense 维度取自 embedding 模型实际输出，避免与配置漂移
-    dim = len(embed_texts(["维度探测"])[0])
+        else:
+            # 维度校验 fail-fast：换 embedding 模型后维度不匹配，insert/检索前即报错
+            _raise_on_dim_mismatch(schema.get("fields", []), dim)
     store = MilvusVectorStore(
         uri=settings.milvus_uri,
         collection_name=COLLECTION_NAME,
@@ -138,6 +164,22 @@ def flush() -> None:
     """
     _ensure_event_loop()
     _get_store().client.flush(COLLECTION_NAME)
+
+
+def ensure_dimension_match() -> None:
+    """启动时校验 embedding 维度：collection 已存在则比对 dense 维度，不一致抛错（fail-fast）
+
+    collection 不存在（首启未上传文档）跳过；旧 schema（无 sparse_embedding）也跳过——
+    会由 _build_store 自动 drop 重建，维度校验交给重建路径。Milvus 连接异常抛给调用方
+    （lifespan）按既有策略降级；只有维度不匹配才强制停机提示重灌。
+    """
+    client = _get_milvus_client()
+    if not client.has_collection(COLLECTION_NAME):
+        return
+    fields = client.describe_collection(COLLECTION_NAME).get("fields", [])
+    if "sparse_embedding" not in [f["name"] for f in fields]:
+        return
+    _raise_on_dim_mismatch(fields, len(embed_texts(["维度探测"])[0]))
 
 
 def ensure_loaded() -> None:

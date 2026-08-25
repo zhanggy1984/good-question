@@ -447,6 +447,7 @@ def test_execute_retrieve_tool_structure(monkeypatch):
 
     class _Retriever:
         max_rerank_score = np.float32(0.9)  # 模拟 rerank 返回的 numpy 标量
+        top_hits = []  # 章节扩充前未设置时退化为 invoke 结果（与 HybridRetriever.__init__ 契约一致）
         def __init__(self, *a, **k):
             pass
         def invoke(self, q):
@@ -578,6 +579,42 @@ def test_stream_chat_retrieve_hit(monkeypatch):
     assert src["sources"][0]["document_name"] == "测试.md"
     tok = next(d for t, d in events if t == "token")
     assert "每月 10 号" in tok["content"]
+
+
+def test_stream_chat_multi_tool_call_trims_to_first(monkeypatch):
+    """DeepSeek 首轮返回多个 tool_call：只执行第一个，且第二轮 assistant.tool_calls 裁剪为 1 个。
+    否则 tool 消息仅回执一个 id 与 assistant.tool_calls 数量不匹配，DeepSeek 第二轮返回 400（实测复现）。"""
+    round2_messages: dict = {}
+
+    def _capturing_stream(messages, tools=None):
+        if tools is None:
+            # 第二轮：捕获消息供断言，返回正常 token 事件
+            round2_messages["msgs"] = messages
+            return iter([
+                {"type": "content", "content": "仅按第一个工具结果作答。"},
+                {"type": "usage", "usage": {"prompt_tokens": 5, "completion_tokens": 2, "total_tokens": 7}},
+            ])
+        # 首轮：返回 2 个 tool_call（不同 id），复现真实 bug 场景
+        return iter([{"type": "tool_call", "tool_calls": [
+            {"id": "call_1", "type": "function",
+             "function": {"name": "hybrid_retrieve", "arguments": '{"query": "a"}'}},
+            {"id": "call_2", "type": "function",
+             "function": {"name": "hybrid_retrieve", "arguments": '{"query": "b"}'}},
+        ]}])
+
+    _patch_chat_pipeline(monkeypatch, tool_result=_TOOL_RESULT_HIT)
+    monkeypatch.setattr(cs, "_stream_deepseek", _capturing_stream)  # 覆盖 _patch_chat_pipeline 的默认 fake
+
+    events = list(cs.stream_chat(1, "多个工具问题"))
+    types = [t for t, _ in events]
+    assert types == ["meta", "tool_call", "sources", "token", "usage", "done"], f"事件序应走命中路径，实际 {types}"
+
+    msgs = round2_messages["msgs"]
+    assistant = next(m for m in msgs if m["role"] == "assistant")
+    assert len(assistant["tool_calls"]) == 1, f"assistant.tool_calls 应裁剪为 1 个，实际 {len(assistant['tool_calls'])}"
+    assert assistant["tool_calls"][0]["id"] == "call_1", "应保留第一个 tool_call"
+    tool_msg = next(m for m in msgs if m["role"] == "tool")
+    assert tool_msg["tool_call_id"] == "call_1", "tool 消息回执应与保留的 tool_call 一致"
 
 
 def test_stream_chat_usage_merged_across_rounds(monkeypatch):
@@ -1136,3 +1173,136 @@ def test_stream_chat_empty_answer_fallback_smalltalk(monkeypatch):
     assert types == ["meta", "token", "usage", "done"], f"实际 {types}"
     tok = next(d for t, d in events if t == "token")
     assert tok["content"] == cs._EMPTY_ANSWER_FALLBACK
+
+
+# ════════ #3 缓存 key 规则化归一 / #4 首轮瞬时错误重试 / #5 sources 精确取 top_hits ════════
+
+
+def test_stream_chat_cache_lookup_uses_normalized_query(monkeypatch):
+    """缓存查询 key 用规则化 query：客套前缀剥离后与干净问法命中同一 key（提高相似问法命中率）"""
+    looked_up = []
+    _patch_chat_pipeline(monkeypatch, round1=[
+        {"type": "content", "content": "工资发放日为每月 10 号。"},
+        {"type": "usage", "usage": {"prompt_tokens": 5, "completion_tokens": 2, "total_tokens": 7}},
+    ])
+    monkeypatch.setattr(cs, "get_cached", lambda library_id, question: looked_up.append(question) or None)
+    list(cs.stream_chat(1, "请问一下工资发放日是几号"))
+    assert looked_up == ["工资发放日是几号"], f"缓存 key 应剥离客套前缀，实际 {looked_up}"
+
+
+def test_stream_chat_cache_write_uses_normalized_query(monkeypatch):
+    """缓存写入 key 同样归一化：同一问题的不同客套表达落同一 key（与查询路径对称）"""
+    written = []
+    _patch_chat_pipeline(monkeypatch, round1=[
+        {"type": "content", "content": "工资发放日为每月 10 号。"},
+        {"type": "usage", "usage": {"prompt_tokens": 5, "completion_tokens": 2, "total_tokens": 7}},
+    ])
+    # 关 F3：query 意图默认触发规则否决强制检索（tool_result=None → 判检索失败不写缓存），
+    # 本测试只验证归一化 key 的写入路径，走 LLM 直接回答的干净路径
+    monkeypatch.setattr(cs.settings, "rule_override_enabled", False)
+    monkeypatch.setattr(cs, "set_cached", lambda library_id, question, payload: written.append((library_id, question)))
+    list(cs.stream_chat(1, "请问一下工资发放日是几号，谢谢"))
+    assert written == [(7, "工资发放日是几号")], f"写入 key 应归一化（去前缀/后缀/尾标点），实际 {written}"
+
+
+def test_stream_round1_retry_transient(monkeypatch):
+    """首轮瞬时错误（429）且未 yield 任何事件：整体退避重试一次，成功后续流"""
+    from types import SimpleNamespace
+    calls = {"n": 0}
+
+    def _boom_then_ok(messages, tools=None):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise httpx.HTTPStatusError(
+                "429 限流", request=object(), response=SimpleNamespace(status_code=429)
+            )
+        yield {"type": "content", "content": "OK"}
+        yield {"type": "usage", "usage": {"total_tokens": 1}}
+
+    monkeypatch.setattr(cs.settings, "chat_llm_max_attempts", 2)
+    monkeypatch.setattr(cs.settings, "chat_llm_retry_backoff_seconds", 0)
+    monkeypatch.setattr(cs, "_stream_deepseek", _boom_then_ok)
+    events = list(cs._stream_round1_with_retry([{"role": "user", "content": "问题"}]))
+    assert calls["n"] == 2, "总调用次数上限 2 = 首次失败后重试一次"
+    assert [e["type"] for e in events] == ["content", "usage"]
+
+
+def test_stream_round1_no_retry_on_401(monkeypatch):
+    """客户端错误（401）非瞬时：不可重试（重试无意义且可能计费），立即抛给上层"""
+    from types import SimpleNamespace
+    calls = {"n": 0}
+
+    def _boom_401(messages, tools=None):
+        calls["n"] += 1
+        raise httpx.HTTPStatusError(
+            "401 未授权", request=object(), response=SimpleNamespace(status_code=401)
+        )
+
+    monkeypatch.setattr(cs.settings, "chat_llm_max_attempts", 2)
+    monkeypatch.setattr(cs, "_stream_deepseek", _boom_401)
+    with pytest.raises(httpx.HTTPStatusError):
+        list(cs._stream_round1_with_retry([{"role": "user", "content": "问题"}]))
+    assert calls["n"] == 1, "401 非瞬时错误不应重试"
+
+
+def test_stream_round1_no_retry_after_yield(monkeypatch):
+    """已 yield 事件后出错不可整体重试：重试会事件序错乱/重复，即使 5xx 也直接抛"""
+    from types import SimpleNamespace
+    calls = {"n": 0}
+
+    def _yield_then_boom(messages, tools=None):
+        calls["n"] += 1
+        yield {"type": "content", "content": "部分内容"}
+        raise httpx.HTTPStatusError(
+            "500 服务端错误", request=object(), response=SimpleNamespace(status_code=500)
+        )
+
+    monkeypatch.setattr(cs.settings, "chat_llm_max_attempts", 2)
+    monkeypatch.setattr(cs, "_stream_deepseek", _yield_then_boom)
+    got = []
+    with pytest.raises(httpx.HTTPStatusError):
+        for ev in cs._stream_round1_with_retry([{"role": "user", "content": "问题"}]):
+            got.append(ev)
+    assert calls["n"] == 1, "已 yield 事件后即使 5xx 也不重试"
+    assert [e["type"] for e in got] == ["content"]
+
+
+def test_stream_round1_max_attempts_follows_config(monkeypatch):
+    """总调用次数 = 配置 chat_llm_max_attempts（含首次）：配置 5、持续 429 时恰好调用 5 次"""
+    from types import SimpleNamespace
+    calls = {"n": 0}
+
+    def _always_429(messages, tools=None):
+        calls["n"] += 1
+        raise httpx.HTTPStatusError(
+            "429 限流", request=object(), response=SimpleNamespace(status_code=429)
+        )
+
+    monkeypatch.setattr(cs.settings, "chat_llm_max_attempts", 5)
+    monkeypatch.setattr(cs.settings, "chat_llm_retry_backoff_seconds", 0)
+    monkeypatch.setattr(cs, "_stream_deepseek", _always_429)
+    with pytest.raises(httpx.HTTPStatusError):
+        list(cs._stream_round1_with_retry([{"role": "user", "content": "问题"}]))
+    assert calls["n"] == 5, "总调用次数应等于配置值（含首次）"
+
+
+def test_execute_retrieve_tool_sources_from_top_hits(monkeypatch):
+    """章节扩充后：sources 取精排 top-3（top_hits）保引用精度，source_count 取扩充后 context 量"""
+    from types import SimpleNamespace
+    top1 = SimpleNamespace(content="A", metadata={"document_name": "a.md", "chunk_index": 0})
+    top2 = SimpleNamespace(content="B", metadata={"document_name": "a.md", "chunk_index": 1})
+    expanded = [top1, top2, SimpleNamespace(content="C", metadata={"document_name": "a.md", "chunk_index": 2})]
+
+    class _Retriever:
+        def __init__(self, *a, **k):
+            self.max_rerank_score = 0.8
+            self.top_hits = [top1, top2]
+
+        def invoke(self, q):
+            return expanded
+
+    monkeypatch.setattr(cs, "HybridRetriever", _Retriever)
+    r = cs._execute_retrieve_tool(7, "问题")
+    assert r["source_count"] == 3, "source_count 应取扩充后 context 量（与 [来源N] 编号一致）"
+    assert len(r["sources"]) == 2, "sources 应精确指向精排 top-3 小节，不随扩充稀释"
+    assert [s["chunk_index"] for s in r["sources"]] == [0, 1]

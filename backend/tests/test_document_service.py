@@ -327,3 +327,43 @@ def test_process_document_releases_processing_after_failure(monkeypatch):
     assert deleted == [1], "失败应清理已写入向量（MySQL 为准）"
     assert db.commits >= 1
     assert db.closed is True
+
+
+# ---------- delete_document（删除文档：清 Milvus + MySQL + 文件 + 问答缓存） ----------
+
+
+def test_delete_document_flushes_cache(tmp_path, monkeypatch):
+    """删除文档后清该库问答缓存：旧答案（引用已删内容）在 TTL 窗口内重放会误导，必须立即失效"""
+    import services.chat_cache as chat_cache
+    import services.document_service as ds
+    from services import vector_store_service
+    from services.document_service import delete_document
+
+    f = tmp_path / "del.pdf"
+    f.write_bytes(b"x")
+    doc = SimpleNamespace(id=1, library_id=7, file_path=str(f))
+
+    class _Db:
+        def __init__(self):
+            self.deleted = None
+
+        def query(self, model):
+            assert model is Document, "delete_document 只应查 Document"
+            return SimpleNamespace(filter=lambda *a, **k: SimpleNamespace(first=lambda: doc))
+
+        def delete(self, row):
+            self.deleted = row
+
+        def commit(self):
+            pass
+
+    deleted_vec = []
+    monkeypatch.setattr(vector_store_service, "delete_by_document", lambda doc_id: deleted_vec.append(doc_id))
+    flushed = []
+    monkeypatch.setattr(chat_cache, "flush_library", lambda library_id: flushed.append(library_id))
+
+    delete_document(_Db(), 1)
+
+    assert deleted_vec == [1]   # 先清 Milvus 向量
+    assert not f.exists()       # 磁盘文件已删
+    assert flushed == [7], "删除后应立即清库问答缓存，而非等 TTL 兜底"

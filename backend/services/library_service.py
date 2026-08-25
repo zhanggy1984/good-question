@@ -63,4 +63,9 @@ def delete_library(db: Session, library_id: int) -> None:
 
     db.delete(lib)
     db.commit()
+
+    # 删库后清该库问答缓存：旧答案（含已删库全量）在 TTL 窗口内重放会误导，必须立即失效
+    from services.chat_cache import flush_library
+    flush_library(library_id)
+
     logger.debug("[library.delete] 删除文档库 id=%s name=%s", library_id, lib.name)

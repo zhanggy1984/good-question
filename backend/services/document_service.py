@@ -307,6 +307,7 @@ def delete_document(db: Session, document_id: int) -> None:
     except Exception as e:
         logger.warning("[document.delete] Milvus 清理失败: %s", e)
 
+    library_id = doc.library_id  # 删前取（db.delete 后实例属性可能失效）
     db.delete(doc)  # 外键 CASCADE 删除 chunks
     db.commit()
 
@@ -315,5 +316,9 @@ def delete_document(db: Session, document_id: int) -> None:
         Path(file_path).unlink(missing_ok=True)
     except OSError as e:
         logger.warning("[document.delete] 删除文件失败 %s: %s", file_path, e)
+
+    # 删除后清该库问答缓存：旧答案（引用已删内容）在 TTL 窗口内重放会误导，必须立即失效
+    from services.chat_cache import flush_library
+    flush_library(library_id)
 
     logger.debug("[document.delete] 删除文档 id=%s", document_id)

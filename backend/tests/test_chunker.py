@@ -176,3 +176,22 @@ def test_splitter_field():
         plain = chunker.chunk_text("无标题的普通文本", 1, 1, "a.txt")
     assert struct[0]["metadata"]["splitter"] == "heading_aware"
     assert plain[0]["metadata"]["splitter"] == "sentence_splitter"
+
+
+def test_section_id_shares_within_section():
+    """章节级检索锚点：同一 section 的 chunk 共享 section_id，跨 section 不同，格式 {doc_id}:{section_idx}
+
+    section_id 是检索层按 (document_id, section_id) 回查同章节兄弟 chunk 扩充 context 的依据，
+    必须稳定标识章节：跨页切分的同一章节 chunk 共享、不同章节严格区分。
+    """
+    md = "# 第一章\n" + "第一章正文。" * 200 + "\n# 第二章\n" + "第二章正文。" * 200
+    with patch.object(chunker, "_get_tokenizer", return_value=FakeTokenizer()):
+        chunks = chunker.chunk_text(md, 1, 1, "a.md")
+    assert len(chunks) >= 2
+    sec1 = [c["metadata"]["section_id"] for c in chunks if c["metadata"]["heading_path"] == ["第一章"]]
+    sec2 = [c["metadata"]["section_id"] for c in chunks if c["metadata"]["heading_path"] == ["第二章"]]
+    assert sec1 and sec2, "两个章节都应产出 chunk"
+    assert len(set(sec1)) == 1, "同一 section 的 chunk 应共享 section_id"
+    assert len(set(sec2)) == 1
+    assert set(sec1) != set(sec2), "不同 section 的 section_id 应不同"
+    assert sec1[0] == "1:0" and sec2[0] == "1:1", f"section_id 应为 {{document_id}}:{{section_idx}}，实际 {sec1[0]}/{sec2[0]}"

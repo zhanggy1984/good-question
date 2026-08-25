@@ -105,6 +105,7 @@ def hybrid_search(
     dense_k: int = 5,
     bm25_k: int = 5,
     limit: int = 6,
+    extra_filters: dict | None = None,
 ) -> list[dict]:
     """Milvus 混合检索：dense + 稀疏双路召回 + RRF 融合
 
@@ -112,13 +113,16 @@ def hybrid_search(
     最终 limit 均为 similarity_top_k（VectorStoreQuery.sparse_top_k 字段未被使用），
     故 similarity_top_k=limit 保总条数；dense_k/bm25_k 保留签名兼容调用方。
     库隔离走 MetadataFilters（kwargs 的 expr 被 _prepare_before_search 忽略）。
+    extra_filters：追加等值过滤（如章节级扩充按 document_id+section_id 取同段兄弟），
+    与 library_id 过滤是 AND 关系。
     混合检索异常时降级为纯 dense 语义检索（不阻塞主链路）；Milvus 整体不可用时
     抛异常，由上层异常处理兜底。
     """
     store = llama_store._get_store()
-    filters = MetadataFilters(
-        filters=[MetadataFilter(key="library_id", value=library_id)]
-    )
+    base = [MetadataFilter(key="library_id", value=library_id)]
+    if extra_filters:
+        base += [MetadataFilter(key=k, value=v) for k, v in extra_filters.items()]
+    filters = MetadataFilters(filters=base)
     try:
         result = store.query(
             VectorStoreQuery(

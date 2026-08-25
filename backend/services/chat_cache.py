@@ -76,13 +76,16 @@ def _client(ignore_circuit_break: bool = False) -> Any | None:
 
 
 def _key(library_id: int, question: str) -> str:
-    """缓存 key：库隔离 + 模型 + 问题 sha256。
+    """缓存 key：库隔离 + 模型（LLM|embedding|rerank）+ 问题 sha256。
 
     不含会话/用户（跨会话共享才有命中价值）；仅存空上下文问答，故 key 无上下文维度。
-    必须含 model：config 支持"切换模型只改 DEEPSEEK_MODEL"，换模型后旧答案要自然失效。
+    必须含三个模型：答案 = LLM 生成 + 检索（embedding 召回 + rerank 精排）三方共同决定，
+    任一模型切换旧答案都不可复用。只含 LLM 模型时换向量模型不触发失效，旧答案基于旧检索
+    重放会误导（缺陷修复）。模型名以 | 分隔防 : 歧义，明文保可读（scan_iter 排查友好）。
     """
     digest = hashlib.sha256(question.strip().encode("utf-8")).hexdigest()[:16]
-    return f"goodq:chat:{library_id}:{settings.deepseek_model}:{digest}"
+    models = f"{settings.deepseek_model}|{settings.embedding_model_name}|{settings.rerank_model_name}"
+    return f"goodq:chat:{library_id}:{models}:{digest}"
 
 
 def get_cached(library_id: int, question: str) -> dict | None:

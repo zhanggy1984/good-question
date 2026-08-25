@@ -677,6 +677,45 @@ def _stream_deepseek(messages: list[dict], tools: list[dict] | None = None):
             yield _tool_call_event(tool_acc)
 
 
+def _is_transient_http_error(e: Exception) -> bool:
+    """瞬时错误判定：429 限流 / 5xx 服务端错误可重试，401 等客户端错误不可
+
+    raise_for_status 抛 httpx.HTTPStatusError；response 为 None（测试 fake）时
+    取不到状态码，视为不可重试（宁可少重试一次也不重复计费）。
+    """
+    if isinstance(e, httpx.HTTPStatusError):
+        resp = getattr(e, "response", None)
+        code = resp.status_code if resp is not None else None
+        return code == 429 or (code is not None and code >= 500)
+    return False
+
+
+def _stream_round1_with_retry(messages: list[dict]):
+    """第一轮 LLM 流式：瞬时错误（429/5xx）且未流出任何事件时退避重试
+
+    仅限首轮整体重试：此阶段尚未 yield 任何 token/sources，重试不会事件序错乱或
+    重复；第二轮失败时首轮事件已发出，无法整体重试，直接抛给上层报错。
+    总调用次数上限 = 配置 chat_llm_max_attempts（含首次），默认 2 = 首次失败后重试 1 次；
+    退避秒数由配置控制（默认 0.5s）。每次重试都是完整付费调用，配置请克制。
+    """
+    max_attempts = max(1, settings.chat_llm_max_attempts)
+    for attempt in range(1, max_attempts + 1):
+        yielded_any = False
+        try:
+            for ev in _stream_deepseek(messages, tools=[RETRIEVE_TOOL_SCHEMA]):
+                yielded_any = True
+                yield ev
+            return
+        except Exception as e:
+            if attempt >= max_attempts or yielded_any or not _is_transient_http_error(e):
+                raise
+            logger.warning(
+                "[chat] LLM 首轮瞬时错误，退避后重试（第 %s/%s 次）: %s",
+                attempt, max_attempts, e,
+            )
+            time.sleep(settings.chat_llm_retry_backoff_seconds)
+
+
 # ════════ 二期 function calling 支撑 ════════
 
 def _ts() -> int:
@@ -705,8 +744,10 @@ def _execute_retrieve_tool(library_id: int, query: str) -> dict:
     source_count / max_score / confidence_band（tool_call 事件 result 与监控日志用）
     """
     retriever = HybridRetriever(library_id=library_id)
-    chunks = retriever.invoke(query)
+    chunks = retriever.invoke(query)  # 章节扩充后的 context（含同节兄弟 chunk）
     max_score = retriever.max_rerank_score
+    # sources 保持精排 top-3 精确小节：章节扩充只扩大喂 LLM 的 context，不稀释引用精度
+    top_hits = retriever.top_hits or chunks
     sources = [
         {
             "document_name": c.metadata.get("document_name", "未知文档"),
@@ -716,12 +757,12 @@ def _execute_retrieve_tool(library_id: int, query: str) -> dict:
             "total_chunks": c.metadata.get("total_chunks"),
             "page_range": c.metadata.get("page_range") or [0, 0],
         }
-        for c in chunks
+        for c in top_hits
     ]
     return {
         "context": _format_docs(chunks),
         "sources": sources,
-        "source_count": len(chunks),
+        "source_count": len(chunks),  # 与 context 的 [来源N] 编号一致（LLM 视角的上下文量）
         # rerank 返回 numpy float32，进 SSE tool_call result 与 JSON 日志须转原生 float（json.dumps 不认 float32）
         "max_score": float(max_score) if max_score is not None else None,
         "confidence_band": _confidence_band(max_score),
@@ -794,7 +835,10 @@ def stream_chat(session_id: int, user_content: str):
         # 非空 history 直接跳过（既不查也不写，避免多轮问答污染无上下文缓存）
         cache_state = "skipped" if history else "miss"
         if not history:
-            cached = get_cached(session.library_id, user_content)
+            # 缓存 key 用规则化 query（去客套/emoji/全角）："请问工资几号发"与"工资几号发"
+            # 归一后同 key，重复/相似问题命中率提升。_replay_cached 落库仍用原文，用户记录不受影响。
+            cache_question = _normalize_query(user_content)
+            cached = get_cached(session.library_id, cache_question)
             if cached:
                 yield from _replay_cached(db, session, user_content, cached)
                 return
@@ -816,7 +860,7 @@ def stream_chat(session_id: int, user_content: str):
         messages = _build_messages(summary, history, user_content)
         tool_calls = None
         try:
-            for ev in _stream_deepseek(messages, tools=[RETRIEVE_TOOL_SCHEMA]):
+            for ev in _stream_round1_with_retry(messages):
                 llm_rounds = 1
                 if ev["type"] == "usage":
                     _merge_usage(ev["usage"])
@@ -824,7 +868,12 @@ def stream_chat(session_id: int, user_content: str):
                     full_reasoning += ev["content"]
                     yield ("reasoning", {"content": ev["content"], "delta": ev["content"], "ts": _ts()})
                 elif ev["type"] == "tool_call":
-                    tool_calls = ev["tool_calls"]
+                    calls = ev["tool_calls"]
+                    # 单工具场景只执行第一个：若原样回传全部 tool_calls 而 tool 消息仅回执一个 id，
+                    # 第二轮 DeepSeek 校验数量不匹配返回 400（实测复现）。裁剪保证协议自洽。
+                    if len(calls) > 1:
+                        logger.warning("[chat] LLM 返回 %s 个 tool_call，仅执行第一个（单工具场景）", len(calls))
+                    tool_calls = calls[:1]
                 else:  # content：LLM 直接回答（决定不检索或未命中前先输出思考文本）
                     full_answer += ev["content"]
                     yield ("token", {"content": ev["content"], "delta": ev["content"], "ts": _ts()})
@@ -844,8 +893,6 @@ def stream_chat(session_id: int, user_content: str):
         non_doc_question = _is_non_doc_question(user_content)
         if decided_retrieve:
             # 2. LLM 决定检索：执行工具，检索完成后再发 tool_call（result 带真实结果）
-            if len(tool_calls) > 1:
-                logger.warning("[chat] LLM 返回 %s 个 tool_call，仅执行第一个（单工具场景）", len(tool_calls))
             try:
                 args = json.loads(tool_calls[0]["function"]["arguments"] or "{}")
                 query = _clean_query(args.get("query"), user_content)
@@ -1099,7 +1146,7 @@ def stream_chat(session_id: int, user_content: str):
         # 文档更新后 flush_library 清库，未找到缓存不会长期误导。检索失败（Milvus 不可用）
         # 的 LLM 兜底不写（retrieval_failed：无文档依据，且 Milvus 恢复后应重新检索）。
         if cache_state == "miss" and llm_rounds > 0 and not _is_smalltalk(user_content) and not retrieval_failed and not empty_fallback:
-            set_cached(session.library_id, user_content, {
+            set_cached(session.library_id, _normalize_query(user_content), {
                 "decided_retrieve": decided_retrieve,
                 "rule_override": rule_override,
                 "query": query if (decided_retrieve or rule_override) else user_content,

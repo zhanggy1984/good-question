@@ -70,6 +70,22 @@ def test_hybrid_search_library_filter():
     assert q.mode == VectorStoreQueryMode.HYBRID
 
 
+def test_hybrid_search_extra_filters_appended():
+    """章节扩充过滤：extra_filters 追加为 AND 等值过滤（与 library_id 并列），不覆盖库隔离"""
+    store = _mock_store()
+    result = Mock()
+    result.nodes = []
+    store.query.return_value = result
+    with patch("services.llama_store._get_store", return_value=store):
+        out = hybrid_search(3, "查询", [0.1, 0.2], extra_filters={"document_id": 1, "section_id": "1:0"})
+    assert out == []
+    q = store.query.call_args[0][0]
+    pairs = {(f.key, f.value) for f in q.filters.filters}
+    assert ("library_id", 3) in pairs, "extra_filters 不得覆盖库隔离过滤"
+    assert ("document_id", 1) in pairs
+    assert ("section_id", "1:0") in pairs
+
+
 def test_hybrid_search_fallback_to_dense():
     """hybrid 检索异常 → 降级纯 dense（mode=DEFAULT），不阻塞主链路"""
     store = _mock_store()
@@ -132,3 +148,67 @@ def test_delete_library_collection():
     assert kwargs["collection_name"] == COLLECTION_NAME
     assert kwargs["filter"] == "library_id == 3"
     flush.assert_called_once()
+
+
+# ════════ 章节级扩充（#5）：按 (document_id, section_id) 回查兄弟 chunk 合并 context ════════
+
+
+def _chunk(text, doc_id, chunk_index, section_id):
+    return RetrievedChunk(
+        content=text,
+        metadata={"document_id": doc_id, "section_id": section_id, "chunk_index": chunk_index},
+    )
+
+
+def test_expand_section_context_merges_siblings():
+    """top-3 涉及的 section 兄弟 chunk 合并进 context（按 chunk_index 去重），顺序 top 在前"""
+    top = [
+        _chunk("A", 1, 0, "1:0"),
+        _chunk("B", 1, 2, "1:0"),
+    ]
+    sibling_hits = [
+        {"document_id": 1, "chunk_index": 1, "text": "sib1",
+         "metadata": {"document_id": 1, "section_id": "1:0", "chunk_index": 1}},
+        {"document_id": 1, "chunk_index": 3, "text": "sib3",
+         "metadata": {"document_id": 1, "section_id": "1:0", "chunk_index": 3}},
+    ]
+    with patch("services.retrieval_service.embed_query", return_value=[0.1]), \
+            patch("services.retrieval_service.vector_store_service.hybrid_search",
+                  return_value=sibling_hits) as hs:
+        retriever = HybridRetriever(library_id=1)
+        merged = retriever._expand_section_context("查询", top)
+    assert [c.content for c in merged] == ["A", "B", "sib1", "sib3"], "top 在前，兄弟 chunk 按命中顺序追加"
+    # 回查按 document_id+section_id 精确过滤，limit 用章节上限
+    _, kwargs = hs.call_args
+    assert kwargs["extra_filters"] == {"document_id": 1, "section_id": "1:0"}
+    assert kwargs["limit"] == 20
+
+
+def test_expand_section_context_skips_without_section_id():
+    """旧数据无 section_id 时天然退化：不扩充，原样返回 top（不查 Milvus）"""
+    top = [_chunk("A", 1, 0, None)]
+    with patch("services.retrieval_service.embed_query") as eq, \
+            patch("services.retrieval_service.vector_store_service.hybrid_search") as hs:
+        retriever = HybridRetriever(library_id=1)
+        out = retriever._expand_section_context("查询", top)
+    assert out is top, "无 section_id 应原样返回"
+    eq.assert_not_called()
+    hs.assert_not_called()
+
+
+def test_expand_section_context_respects_total_cap(monkeypatch):
+    """扩充总量上限：合并结果截断到 _SECTION_EXPAND_TOTAL，防大 section 撑爆 prompt"""
+    monkeypatch.setattr("services.retrieval_service._SECTION_EXPAND_TOTAL", 3)
+    top = [_chunk("A", 1, 0, "1:0"), _chunk("B", 1, 1, "1:0")]
+    sibling_hits = [
+        {"document_id": 1, "chunk_index": 2, "text": "sib2",
+         "metadata": {"document_id": 1, "section_id": "1:0", "chunk_index": 2}},
+        {"document_id": 1, "chunk_index": 3, "text": "sib3",
+         "metadata": {"document_id": 1, "section_id": "1:0", "chunk_index": 3}},
+    ]
+    with patch("services.retrieval_service.embed_query", return_value=[0.1]), \
+            patch("services.retrieval_service.vector_store_service.hybrid_search",
+                  return_value=sibling_hits):
+        retriever = HybridRetriever(library_id=1)
+        merged = retriever._expand_section_context("查询", top)
+    assert len(merged) == 3, "扩充后应受总量上限截断"

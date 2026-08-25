@@ -133,7 +133,10 @@ def chunk_text(
     # overlap 补偿，不硬切断裂）。@@PAGE:n@@ 仅作定位信息写入 page_range。
     # 有无标题统一走结构切分——无标题文本天然单 section，heading_path 全空。
     sections = _split_markdown_sections(text)
-    for section in sections:
+    for section_idx, section in enumerate(sections):
+        # section_id：稳定标识该 section（跨页切分后同一章节的 chunk 共享），供检索层
+        # 按 (document_id, section_id) 取同章节兄弟 chunk 扩充上下文（章节级检索）
+        section_id = f"{document_id}:{section_idx}"
         chunks = splitter.split_text(section["content"])
         for j, content in enumerate(chunks):
             content = content.strip()
@@ -145,6 +148,7 @@ def chunk_text(
                     "document_id": document_id,
                     "document_name": document_name,
                     "library_id": library_id,
+                    "section_id": section_id,
                     "heading_path": section["heading_path"],
                     "heading_level": section["heading_level"],
                     "source_type": _infer_source_type(content),

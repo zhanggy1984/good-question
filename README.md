@@ -6,7 +6,7 @@
 
 - **做什么**：把私有文档变成可问答的知识库。上传的每份文档都被自动切成片段并向量化，你只需像聊天一样提问，模型**只基于你的文档作答，答必带引用出处**。
 - **怎么做**：**LLM 自主决定是否检索**（function calling 编排）→ 命中检索则**混合检索 + 重排 + 置信分级** → 大模型带来源流式作答；规则护栏在"该查不查"和"查不到就编"两个口子上兜底。
-- **好在哪**：答必有据、不编造、多用户隔离、首包秒回；对外是契约对齐的 SSE 事件流，有 143 项单元测试 + 运行时契约验证脚本，开箱即验。
+- **好在哪**：答必有据、不编造、多用户隔离、首包秒回；对外是契约对齐的 SSE 事件流，有 167 项单元测试 + 运行时契约验证脚本，开箱即验。
 
 ## 目录
 
@@ -335,6 +335,7 @@ event: error      LLM 调用失败兜底
 | `RERANK_MODEL_NAME` | 精排模型（多语言，较 v1-base 更准；CPU 更慢） | `BAAI/bge-reranker-v2-m3` |
 | `SIMILARITY_THRESHOLD_LOW` | 无结果兜底阈值：rerank 最高分低于此值才判"文档无关"返回空 | `0.20` |
 | `RERANK_LOW_CONFIDENCE_THRESHOLD` | 低置信阈值：最高分落在 [LOW, 此值) 判"相关性存疑"，LLM 被提示如实回答 | `0.50` |
+| `CHAT_LLM_MAX_ATTEMPTS` / `CHAT_LLM_RETRY_BACKOFF_SECONDS` | LLM 首轮总调用次数上限（含首次，默认 2 = 首次失败后重试 1 次）/ 瞬时错误退避秒数 | `2` / `0.5` |
 | `MILVUS_HOST/PORT` | Milvus 连接地址 | `milvus` / `19530` |
 | `ATTU_PORT` | Attu 可视化管理 UI 端口 | `8000` |
 | `MINERU_API_TOKEN` | MinerU 官方 API Token（空 = 本地解析） | 空 |
@@ -371,7 +372,7 @@ good-question/
 │   ├── middleware/           # JWT 鉴权 Depends
 │   ├── utils/                # mineru_extractor / mineru_api / text_cleaner / chunker / security / exceptions
 │   ├── alembic/              # 数据库迁移（versions/：0001~0003）
-│   ├── tests/                # 单元测试（143 个测试函数，pytest 已内置镜像）
+│   ├── tests/                # 单元测试（167 个测试函数，pytest 已内置镜像）
 │   ├── requirements.txt      # 生产依赖
 │   └── requirements-dev.txt  # 测试依赖（pytest，已装进镜像）
 ├── frontend/                 # Vue 3 + Naive UI 前端
@@ -397,7 +398,7 @@ good-question/
 
 | 层 | 内容 | 说明 |
 |----|------|------|
-| 单元测试 | `backend/tests/` 143 个测试函数 | 安全 / 清洗 / 切片（含跨页全局 section、@@PAGE 页码）/ 文档服务（含 reprocess 双层防并发）/ embedding / 检索 / 聊天服务（含五维度防注入、两级置信档边界、闲聊粗判、未命中固定话术、F3 规则否决权与豁免分支、LLM 空返回兜底、HTTP 错误显式化）/ chat_cache（key 隔离、版本失效、熔断降级、SSE 重放事件序）/ llama_store，纯函数级，不依赖外部服务 |
+| 单元测试 | `backend/tests/` 165 个测试函数 | 安全 / 清洗 / 切片（含跨页全局 section、@@PAGE 页码、章节 section_id）/ 文档服务（含 reprocess 双层防并发、删除失效缓存）/ embedding / 检索（含章节扩充、extra_filters 库隔离）/ 聊天服务（含五维度防注入、两级置信档边界、闲聊粗判、未命中固定话术、F3 规则否决权与豁免分支、LLM 空返回兜底、HTTP 错误显式化、缓存 key 规则化归一、首轮瞬时错误重试）/ chat_cache（key 隔离、模型维度、版本失效、熔断降级、SSE 重放事件序）/ llama_store（node↔hit、embedding 维度 fail-fast）/ api（断连检测），纯函数级，不依赖外部服务 |
 | 契约验证 | `verify_contract.py` | 运行时读真实 SSE 事件流，断言事件序（meta 首、usage 在 done 前）与字段完整（meta/tool_call/usage/reasoning/token/ts）；`tool_call.status` 支持 ok/error（LLM 决策）与 rule_override/rule_override_error（三期规则否决） |
 | 迁移验证 | `test-data/e2e.py` / `chat.py` / `verify_old_data.py` | 登录→建库→上传→就绪 / chat 完整链路读 SSE / 旧数据重灌后检索验证 |
 | 前端构建 | `npm run build` | 改了前端代码必须先 build，否则 nginx 里是旧页面 |
@@ -502,7 +503,7 @@ python verify_contract.py                                          # 宿主机�
    - **离线入库代价**：BGE-M3 学习稀疏编码 CPU 每批 64 条约 3.5 分钟，大批量重灌（migrate）耗时以十分钟计——这是从服务端 BM25 迁移到学习稀疏的固有性能代价（换 GPU 推理可缓解）。
    - 可选方向：GPU 推理、更小的 rerank 模型、或更激进的候选控制（均已评估，各有取舍，尚未落地）。
 2. **模型全 CPU 推理**：embedding、稀疏编码与 rerank 均为 CPU，重负载场景可考虑 GPU 容器。
-3. **问答缓存仅精确命中**：Redis 缓存 key 为"库 + 模型 + 问题"，仅完全一致的问题命中并重放；语义相近或带多轮上下文变体的问题会走完整调用（DeepSeek 计费）。高频率场景可评估语义级缓存。
+3. **问答缓存仅精确命中（query 已规则化归一）**：Redis 缓存 key 为"库 + 模型维度 + 规则化 query"——key 纳入 LLM/embedding/rerank 三个模型名（换模型不串答案），query 经规则化归一（剥离客套/emoji、全角转半角）提升相似问法命中率；语义相近或带多轮上下文变体的问题仍走完整调用（DeepSeek 计费）。高频率场景可评估语义级缓存。
 
 ---
 
@@ -510,6 +511,7 @@ python verify_contract.py                                          # 宿主机�
 
 | 版本 | 日期 | 核心内容 |
 |------|------|----------|
+| **2.0.4** | 2026-08-25 | 问答缓存精准化与对话可靠性加固：缓存 key 纳入 embedding/rerank 模型维度（换模型不串答案）+ 规则化 query 归一化（去客套/emoji/全角，相似问法命中率提升）+ 删除文档/删库即失效缓存；LLM 首轮瞬时错误（429/5xx）自动退避重试 1 次（仅未 yield 事件时整体重试）；章节级检索扩充（同章节兄弟 chunk 合并 context，sources 保持精排 top-3 精确引用）；前端"停止生成"（AbortController）+ 后端断连检测（客户端断开即终止 LLM 调用，不烧 token）；换 embedding 模型维度不匹配启动 fail-fast 报错提示重灌；修复 LLM 首轮返回多 tool_call 时未裁剪导致第二轮 400（assistant 只声明执行的第一个 tool_call，tool 消息与之对齐） |
 | **2.0.3** | 2026-08-25 | 长答案治理：system prompt 追加答案长度约束（常规问答 ≤200 字，总结/列举类 ≤600 字）+ 前端长答案折叠（超 500 字折叠，流式生成中始终展开）；README 彻底重排为新人友好结构，系统架构章补充"编排模式"主线（LLM 自主决策 + 规则否决 + 空结果兜底） |
 | **2.0.2** | 2026-08-25 | Redis 问答缓存：精确 key（库+模型+问题 sha256）、连接熔断降级、库级失效、缓存命中 SSE 事件重放（事件序对齐真实流程 + `intent`/`non_doc_question` 透传防前端误示空命中）；Prompt 五维度法防注入 + 检索服务不可用兜底 + query 清洗；`tool_call` 检索三态透传（前端空命中/可信度偏低提示）；chunk 跨页全局 section 切分 + `@@PAGE` 页码标记 + 清洗增强；文档重新处理（reprocess）：failed/ready 重试、可选切分参数覆盖、双层防并发（内存原子占用 + DB status） |
 | **2.0.1** | 2026-08-24 | 三期 F3 规则否决权：LLM 决定不检索但规则判该查（query/unknown）时强制检索防编造；纯计算/常识豁免（`_is_non_doc_question`）；`rule_agree` 公式修正（unknown 纳入"该查"集合）；`tool_call.status` 新增 `rule_override`/`rule_override_error`；`tool_decision` 日志加 `rule_override`/`non_doc_question` 字段 |
