@@ -190,6 +190,30 @@ def test_clean_query():
     # 超长无标点连写：硬截到上限保信息量
     long_no_boundary = "查" * (cs._QUERY_MAX_LEN + 100)
     assert len(cs._clean_query(long_no_boundary, "问题原文")) == cs._QUERY_MAX_LEN
+    # 规则化去噪先于截断：客套/全角数字在超长判定前已被清洗
+    assert cs._clean_query("请问１２３条", "问题原文") == "123条"
+
+
+def test_normalize_query():
+    """规则化去噪：全角数字/字母转半角、去 emoji/客套、压冗余标点；剥空回退原文"""
+    # 全角数字/英文字母 → 半角；中文标点保留（避免稀疏检索 token 错位）
+    assert cs._normalize_query("员工１２３条，ＡＢＣ方案") == "员工123条，ABC方案"
+    assert cs._normalize_query("第１条制度") == "第1条制度"
+    # emoji / 变体选择符去除
+    assert cs._normalize_query("工资几号发😀") == "工资几号发"
+    assert cs._normalize_query("缺勤怎么办👍") == "缺勤怎么办"
+    # 口语客套前缀（完整词锚定，不单删"请/帮"等可能为实义的单字）
+    assert cs._normalize_query("请问事假提前几天申请") == "事假提前几天申请"
+    assert cs._normalize_query("帮我查一下Docker常用命令") == "Docker常用命令"
+    assert cs._normalize_query("麻烦你帮我看看考勤制度") == "考勤制度"
+    assert cs._normalize_query("我想问下年假有几天") == "年假有几天"
+    # 口语客套后缀（含前导逗号一并清理）
+    assert cs._normalize_query("工资几号发，谢谢") == "工资几号发"
+    assert cs._normalize_query("缺勤怎么处理辛苦啦") == "缺勤怎么处理"
+    # 连续空白压缩
+    assert cs._normalize_query("请假  提前  几天") == "请假 提前 几天"
+    # 剥空回退原文（防空 query 拖垮召回）
+    assert cs._normalize_query("请问。谢谢") == "请问。谢谢"
 
 
 def test_is_smalltalk_boundaries():
