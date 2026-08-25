@@ -48,3 +48,52 @@ def test_unify_newlines():
 
 def test_remove_bom():
     assert clean_text("﻿开头文本") == "开头文本"
+
+
+def test_zero_width_space_removed():
+    # 零宽空格不可见但会打断 embedding 中文切分（"工资​发放"），必须删除
+    assert clean_text("工资​发放") == "工资发放"
+
+
+def test_zero_width_joiners_removed():
+    assert clean_text("a‍b‌c") == "abc"
+
+
+def test_nbsp_to_space():
+    assert clean_text("a b") == "a b"
+
+
+def test_inline_bom_removed():
+    # 行中 BOM（非行首）也要删除，不能只 lstrip
+    assert clean_text("a﻿b") == "ab"
+
+
+def test_page_marker_preserved():
+    """页标记 @@PAGE:n@@ 是 chunker 的页边界协议，清洗必须原样保留"""
+    assert clean_text("@@PAGE:3@@\n正文") == "@@PAGE:3@@\n正文"
+
+
+def test_repeated_lines_disabled_by_default():
+    """页眉/页脚去重默认关闭：规则未经验证，误删风险不能进默认路径"""
+    header = "机密资料"
+    text = "\n".join([header] * 7)
+    assert clean_text(text) == text
+
+
+def test_repeated_short_lines_removed_when_enabled():
+    """开启后：短行（≤30 字符）重复 ≥5 次视为页眉/页脚噪声只留首行；长行正文全保留"""
+    header = "机密资料"  # 5 字符短行，重复 7 次
+    body = "这是一段超过三十个字符长度的正常正文长文本行，用于验证不受去重影响。"  # 长行
+    lines = [header, body] * 3 + [header, body, header]
+    text = "\n".join(lines)
+    cleaned = clean_text(text, dedupe_repeated_lines=True)
+    assert cleaned.count(header) == 1, "短行重复 ≥5 次应只保留首行"
+    assert cleaned.count(body) == 4, "长行（正文）不应被去重"
+
+
+def test_short_repeated_below_threshold_kept():
+    """重复次数 < 5 的短行保留（阈值保守，避免误删正文中少量重复的短语）"""
+    header = "注意"  # 只重复 3 次 < 5
+    text = "\n".join(["正文", header] * 3)
+    cleaned = clean_text(text, dedupe_repeated_lines=True)
+    assert cleaned.count(header) == 3

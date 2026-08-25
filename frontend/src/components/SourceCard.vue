@@ -4,7 +4,7 @@
       <span class="doc-icon">📄</span>
       <span class="doc-name">{{ source.document_name }}</span>
       <span v-if="source.chunk_index !== undefined && source.chunk_index !== null" class="chunk-info">
-        片段 {{ source.chunk_index + 1 }}/{{ source.total_chunks }}
+        片段 {{ source.chunk_index + 1 }}/{{ source.total_chunks }}{{ pageLabel }}
       </span>
     </div>
     <div v-if="source.heading_path && source.heading_path.length" class="heading-path">
@@ -15,9 +15,17 @@
 </template>
 
 <script setup lang="ts">
+import { computed } from 'vue'
 import type { Source } from '@/api/session'
 
-defineProps<{ source: Source }>()
+const props = defineProps<{ source: Source }>()
+
+// 页码：新版 page_range（单页 N / 跨页 A-B）；旧版消息回退到单值 page_number
+const pageLabel = computed(() => {
+  const r = props.source.page_range ?? (props.source.page_number ? [props.source.page_number, props.source.page_number] : null)
+  if (!r || r[1] <= 0) return ''
+  return r[0] === r[1] ? ` · 第 ${r[0]} 页` : ` · 第 ${r[0]}-${r[1]} 页`
+})
 </script>
 
 <style scoped>

@@ -3,15 +3,55 @@
 在切片/向量化前对抽取的文本做规范化处理，提升后续检索与向量化质量：
 - 去 BOM、统一换行符
 - 全角英文字母/数字/符号转半角（NFKC 规范化）
-- 移除控制字符
+- 移除控制字符与不可见噪声（零宽空格/NBSP）
 - 压缩空白与空行
+- （可选，默认关）页眉/页脚/页码重复短行去除
 """
 import re
 import unicodedata
 
+# 页眉/页脚/页码去重的保守阈值：
+# - 只处理 ≤ _REPEAT_MAX_LEN 字符的短行（页眉/页脚/页码都是短行，长行是正文）
+# - 全文出现 ≥ _REPEAT_MIN_COUNT 次才视为跨页重复噪声（阈值取大，宁可漏删不可误删）
+_REPEAT_MAX_LEN = 30
+_REPEAT_MIN_COUNT = 5
 
-def clean_text(text: str) -> str:
-    """预清洗：规范化文本，保持段落结构（\n）"""
+
+def _remove_repeated_lines(text: str) -> str:
+    """移除跨页重复的短行（页眉/页脚/页码噪声），保留首次出现。
+
+    逐页抽取的 PDF 会把每页页眉（公司名/章节名）、页脚（页码/版权）重复 N 次；
+    不清理会产出语义冗余 chunk，污染向量库与 rerank 候选。
+    启发式：短行且全文出现 ≥ _REPEAT_MIN_COUNT 次视为噪声，只保留首次出现；
+    正文中合法重复的短短语同样保留一份，不丢信息；长行（正文）不受影响。
+    """
+    from collections import Counter
+
+    lines = text.split("\n")
+    counts = Counter(lines)
+    seen: set[str] = set()
+    keep: list[str] = []
+    for line in lines:
+        stripped = line.strip()
+        if (
+            stripped
+            and len(stripped) <= _REPEAT_MAX_LEN
+            and counts[line] >= _REPEAT_MIN_COUNT
+            and line in seen
+        ):
+            continue  # 噪声重复行：首次出现已保留，跳过
+        keep.append(line)
+        seen.add(line)
+    return "\n".join(keep)
+
+
+def clean_text(text: str, dedupe_repeated_lines: bool = False) -> str:
+    """预清洗：规范化文本，保持段落结构（\n）
+
+    dedupe_repeated_lines：页眉/页脚/页码重复短行去除（保守启发式）。
+    默认关闭：规则依赖阈值猜测，误删风险需真实样本/评测基线验证后才默认开启
+    （solution.md 13.3 的教训：拍脑袋优化会倒退）。
+    """
     if not text:
         return ""
 
@@ -33,13 +73,24 @@ def clean_text(text: str) -> str:
     # 4. 移除控制字符（保留换行和制表符）
     text = "".join(ch for ch in text if ch >= " " or ch in "\n\t")
 
-    # 5. 全角空格转半角（NFKC 已处理，这里兜底）
+    # 5. 不可见噪声：零宽字符（U+200B/C/D）删除——不可见但会打断 embedding tokenizer
+    #    的中文切分（"工资​发放"被拆成两段，检索精度受损）；NBSP(U+00A0) 转普通
+    #    空格；行中 BOM(U+FEFF) 删除（行首的已在第 1 步 lstrip）。
+    text = text.replace("​", "").replace("‌", "").replace("‍", "")
+    text = text.replace("﻿", "")
+    text = text.replace(" ", " ")
+
+    # 6. 全角空格转半角（NFKC 已处理，这里兜底）
     text = text.replace("　", " ")
 
-    # 6. 压缩连续空行为最多两个换行（保留段落分隔）
+    # 7. 压缩连续空行为最多两个换行（保留段落分隔）
     text = re.sub(r"\n{3,}", "\n\n", text)
 
-    # 7. 行尾多余空白
+    # 8. 行尾多余空白
     text = re.sub(r"[ \t]+$", "", text, flags=re.M)
+
+    # 9. 页眉/页脚/页码重复短行去除（保守启发式，默认关闭，见函数 docstring）
+    if dedupe_repeated_lines:
+        text = _remove_repeated_lines(text)
 
     return text.strip()

@@ -131,13 +131,15 @@ def _extract_with_mineru(file_path: str, timeout: int = MIN_TIMEOUT) -> str:
 
 
 def _extract_pdf(path: str) -> str:
-    """PDF 降级：PyMuPDF 逐页抽取"""
+    """PDF 降级：PyMuPDF 逐页抽取，逐页前插入 @@PAGE:n@@ 标记（chunker 据此写页码）"""
     import fitz
 
     doc = fitz.open(path)
     parts = []
-    for page in doc:
-        parts.append(page.get_text())
+    for i, page in enumerate(doc):
+        page_text = page.get_text()
+        if page_text.strip():  # 空白页（纯图片页）跳过，无页码
+            parts.append(f"@@PAGE:{i + 1}@@\n{page_text}")
     doc.close()
     return "\n".join(parts)
 

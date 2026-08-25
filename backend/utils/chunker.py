@@ -4,6 +4,7 @@
 - Markdown 按标题层级分节，chunk 带 heading_path 元数据（溯源）
 - 其他格式直接切分
 """
+import hashlib
 import logging
 import re
 from functools import lru_cache
@@ -30,13 +31,27 @@ def _count_tokens(text: str) -> int:
     return len(_get_tokenizer().encode(text))
 
 
+_PAGE_MARKER_RE = re.compile(r"^@@PAGE:(\d+)@@\s*$", re.MULTILINE)
+
+
 def _split_markdown_sections(md_text: str) -> list[dict]:
-    """按标题层级切分 Markdown，返回 [{heading_path, content}]"""
+    """跨页全局结构切分，返回 [{heading_path, heading_level, content, page_range}]
+
+    @@PAGE:n@@ 行作页定位：更新当前页号、不进 content。heading_stack 全局延续——
+    PDF 上一页的一级标题在下一页仍是祖先，heading_level 跨页正确（不按页重置）。
+    section 记录覆盖的页范围 page_range=[start, end]（无标记恒 [0,0]）。
+    无标题文本天然单 section（heading_path=[]、heading_level=0）。
+    """
     sections = []
     heading_stack: list[tuple[int, str]] = []
     current: dict | None = None
+    current_page = 0
 
     for line in md_text.splitlines():
+        pm = _PAGE_MARKER_RE.match(line.strip())
+        if pm:  # 页标记行：仅更新当前页，不进入任何 section 的 content
+            current_page = int(pm.group(1))
+            continue
         m = re.match(r"^(#{1,6})\s+(.*)$", line)
         if m:
             level = len(m.group(1))
@@ -47,10 +62,24 @@ def _split_markdown_sections(md_text: str) -> list[dict]:
             heading_stack.append((level, title))
             if current is not None:
                 sections.append(current)
-            current = {"heading_path": [t for _, t in heading_stack], "content": ""}
+            current = {
+                "heading_path": [t for _, t in heading_stack],
+                "heading_level": level,
+                "content": "",
+                "page_range": [current_page, current_page],
+            }
         else:
             if current is None:
-                current = {"heading_path": [], "content": ""}
+                current = {
+                    "heading_path": [], "heading_level": 0, "content": "",
+                    "page_range": [current_page, current_page],
+                }
+            else:
+                # 正文跨页时 section 的页范围随之扩大（section 允许跨页）
+                current["page_range"] = [
+                    min(current["page_range"][0], current_page),
+                    max(current["page_range"][1], current_page),
+                ]
             current["content"] += line + "\n"
 
     if current is not None:
@@ -100,14 +129,13 @@ def chunk_text(
 
     results: list[dict] = []
 
-    # Markdown 按标题分节，否则整篇递归切
-    sections = _split_markdown_sections(text) if text.lstrip().startswith("#") else [
-        {"heading_path": [], "content": text}
-    ]
-
+    # 跨页全局结构切分：section 是语义单元，可跨页（页缝处由同 section 的 splitter
+    # overlap 补偿，不硬切断裂）。@@PAGE:n@@ 仅作定位信息写入 page_range。
+    # 有无标题统一走结构切分——无标题文本天然单 section，heading_path 全空。
+    sections = _split_markdown_sections(text)
     for section in sections:
         chunks = splitter.split_text(section["content"])
-        for content in chunks:
+        for j, content in enumerate(chunks):
             content = content.strip()
             if not content:
                 continue
@@ -118,8 +146,16 @@ def chunk_text(
                     "document_name": document_name,
                     "library_id": library_id,
                     "heading_path": section["heading_path"],
+                    "heading_level": section["heading_level"],
                     "source_type": _infer_source_type(content),
                     "token_count": _count_tokens(content),
+                    "page_range": list(section["page_range"]),
+                    # overlap 由切分器精确给出：同 section 内非首 chunk 必与前一个重叠
+                    # （SentenceSplitter chunk_overlap=102），跨 section 首 chunk 无重叠。
+                    # 存储层据该 index 映射 DB id。
+                    "overlap_prev_chunk_index": (len(results) - 1) if j > 0 else None,
+                    "content_hash": hashlib.sha256(content.encode("utf-8")).hexdigest()[:8],
+                    "splitter": "heading_aware" if section["heading_path"] else "sentence_splitter",
                 },
             })
 

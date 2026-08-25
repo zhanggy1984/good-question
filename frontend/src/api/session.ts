@@ -17,6 +17,9 @@ export interface Source {
   chunk_content: string
   chunk_index: number
   total_chunks: number
+  page_range?: number[]
+  page_number?: number // 旧版消息兼容（sources_json 历史数据）
+  heading_level?: number
 }
 
 export interface ChatMessage {
