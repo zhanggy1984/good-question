@@ -6,6 +6,7 @@ pymilvus 由 conftest 条件 stub 兜底，宿主机可离线运行。
 """
 import json
 import sys
+from datetime import datetime
 
 import httpx
 import pytest
@@ -509,6 +510,7 @@ def _patch_chat_pipeline(monkeypatch, tool_result=None, round1=None, round2=None
     class _FakeSession:
         id = 1
         library_id = 7
+        updated_at = datetime.now()  # 活跃会话：惰性清理判定不过期（真实模型 updated_at NOT NULL）
 
     class _FakeDb:
         def query(self, *a, **k):
@@ -517,8 +519,15 @@ def _patch_chat_pipeline(monkeypatch, tool_result=None, round1=None, round2=None
             return self
         def first(self):
             return _FakeSession()
+        def execute(self, *a, **k):
+            return _FakeExpiredResult()
         def close(self):
             pass
+
+    class _FakeExpiredResult:
+        """is_session_expired 的 DB 判定结果：活跃会话不过期（惰性清理跳过）"""
+        def first(self):
+            return (False,)
 
     def _fake_stream(messages, tools=None):
         return iter(round1 if tools else (round2 if round2 is not None else round1))

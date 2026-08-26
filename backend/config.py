@@ -38,6 +38,14 @@ class Settings(BaseSettings):
     chat_cache_enabled: bool = True
     chat_cache_ttl_seconds: int = 7200
 
+    # 会话过期清理：超过保留期（最后活跃时间 updated_at）未更新的会话物理删除。
+    # 硬删除不可逆，保留期勿设过小；异常时设 CHAT_CLEANUP_ENABLED=false 可一键停。
+    # 双机制：定时 sweep（后台 asyncio 循环）+ 查询时惰性清理（详情/聊天/列表入口兜底）。
+    chat_retention_days: int = 30
+    chat_cleanup_enabled: bool = True
+    chat_cleanup_interval_seconds: int = 3600
+    chat_cleanup_batch_size: int = 500
+
     # Embedding（默认与 .env.example 一致；换模型须保证向量维度与 Milvus collection 一致）
     embedding_model_name: str = "jinaai/jina-embeddings-v2-base-zh"
     embedding_device: str = "cpu"

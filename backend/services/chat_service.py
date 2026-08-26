@@ -13,6 +13,11 @@ from config import settings
 from database import SessionLocal
 from models import ChatMessage, ChatSession
 from schemas.common import Page
+from services.chat_cleanup import (
+    delete_session_by_id,
+    expired_session_condition,
+    is_session_expired,
+)
 from services.chat_cache import get_cached, replay_events, set_cached
 from services.llm_service import get_llm
 from services.retrieval_service import HybridRetriever
@@ -270,7 +275,11 @@ def list_sessions(
     db: Session, user_id: int, library_id: int | None, page: int, page_size: int
 ) -> Page:
     """当前用户的会话列表（可按库过滤，按更新时间倒序）"""
-    query = db.query(ChatSession).filter(ChatSession.user_id == user_id)
+    query = db.query(ChatSession).filter(
+        ChatSession.user_id == user_id,
+        # 惰性清理：过期会话不展示（DB 侧 NOW() 判定，避免 Python/DB 时区错位）；删除由定时 sweep 兜底
+        ChatSession.updated_at >= expired_session_condition(),
+    )
     if library_id:
         query = query.filter(ChatSession.library_id == library_id)
     total = query.count()
@@ -290,6 +299,10 @@ def _get_owned_session(db: Session, session_id: int, user_id: int) -> ChatSessio
         raise NotFoundError("会话不存在")
     if session.user_id != user_id:
         raise ForbiddenError("无权访问该会话")
+    # 惰性清理：过期会话（DB 侧判定）物理删除并视作不存在（定时 sweep 兜底前的即时回收）
+    if is_session_expired(db, session.id):
+        delete_session_by_id(db, session.id)
+        raise NotFoundError("会话不存在")
     return session
 
 
@@ -815,6 +828,12 @@ def stream_chat(session_id: int, user_content: str):
         t_start = time.time()
         session = db.query(ChatSession).filter(ChatSession.id == session_id).first()
         if session is None:
+            yield ("error", {"message": "会话不存在"})
+            return
+        # 惰性清理：过期会话（DB 侧判定）物理删除并视作不存在。删除后立即 return
+        # 不进入后续流程——活跃会话因发消息刷新 updated_at 不会被判过期，无并发写丢失
+        if is_session_expired(db, session_id):
+            delete_session_by_id(db, session.id)
             yield ("error", {"message": "会话不存在"})
             return
 

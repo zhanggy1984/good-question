@@ -60,7 +60,20 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning("[lifespan] Milvus collection 加载失败（不影响启动）: %s", e)
 
+    # 会话过期清理：定时 sweep 随应用启停（受开关控制，异常可一键停）
+    from services.chat_cleanup import SessionCleaner
+    chat_cleaner = SessionCleaner()
+    if settings.chat_cleanup_enabled:
+        chat_cleaner.start()
+        logger.info(
+            "[lifespan] 会话过期清理已启动（保留 %s 天，间隔 %ss）",
+            settings.chat_retention_days,
+            settings.chat_cleanup_interval_seconds,
+        )
+
     yield
+    if settings.chat_cleanup_enabled:
+        await chat_cleaner.stop()
     logger.info("[lifespan] Native RAG 关闭")
 
 

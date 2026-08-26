@@ -6,7 +6,7 @@
 
 - **做什么**：把私有文档变成可问答的知识库。上传的每份文档都被自动切成片段并向量化，你只需像聊天一样提问，模型**只基于你的文档作答，答必带引用出处**。
 - **怎么做**：**LLM 自主决定是否检索**（function calling 编排）→ 命中检索则**混合检索 + 重排 + 置信分级** → 大模型带来源流式作答；规则护栏在"该查不查"和"查不到就编"两个口子上兜底。
-- **好在哪**：答必有据、不编造、多用户隔离、首包秒回；对外是契约对齐的 SSE 事件流，有 167 项单元测试 + 运行时契约验证脚本，开箱即验。
+- **好在哪**：答必有据、不编造、多用户隔离、首包秒回；对外是契约对齐的 SSE 事件流，有 178 项单元测试 + 运行时契约验证脚本，开箱即验。
 
 ## 目录
 
@@ -304,6 +304,15 @@ event: error      LLM 调用失败兜底
 - **prompt 约束**：system prompt 明确答案长度——常规问答 ≤200 字，总结/列举类可展开但 ≤600 字，避免模型堆砌客套废话；
 - **前端折叠**：答案超 500 字自动折叠成限高滚动区，点"展开完整回答"再看全文；流式生成过程中始终展开，保证输出过程可见、自动滚动正常。
 
+### 10. 会话过期清理：定时 + 惰性双保险
+会话数据按**最后活跃时间**治理——超过保留期（`CHAT_RETENTION_DAYS`，默认 30 天）的会话物理删除，`chat_messages` 由外键 `ON DELETE CASCADE` 级联清理，不残留孤儿消息。三层保障：
+
+- **定时 sweep**：`SessionCleaner` 后台 asyncio 循环（lifespan 启停，默认每小时），分批 `DELETE ... ORDER BY id LIMIT 500` + 批间让步，避免大事务拖垮 MySQL；
+- **惰性兜底**：详情 / 聊天入口访问过期会话即删即视为不存在，列表入口过滤隐藏过期会话（物理删除由定时 sweep 兜底）——定时器还没轮到它，用户先碰到它也拦得住；
+- **时区无关判定**：过期判定统一在 DB 侧 `NOW() - INTERVAL`，Python 不生成 cutoff——容器时区与 MySQL 时区不一致也不会系统性错删/漏删。
+
+配套 `idx_updated_at` 索引迁移（0004）；`CHAT_CLEANUP_ENABLED=false` 一键停用（硬删除不可逆，保留期勿设过小）。
+
 ---
 
 ## 六、技术栈一览
@@ -342,6 +351,10 @@ event: error      LLM 调用失败兜底
 | `HF_ENDPOINT` | HuggingFace 下载镜像（国内加速） | `https://hf-mirror.com` |
 | `ADMIN_USERNAME/PASSWORD` | 管理员账号 | `admin` / `change_me_admin` |
 | `JWT_SECRET_KEY` | JWT 签名密钥（生产必须改） | `change-me` |
+| `CHAT_RETENTION_DAYS` | 会话保留天数（最后活跃超期物理删除，硬删除不可逆） | `30` |
+| `CHAT_CLEANUP_ENABLED` | 会话过期清理总开关（异常时设 `false` 一键停） | `true` |
+| `CHAT_CLEANUP_INTERVAL_SECONDS` | 定时 sweep 间隔 | `3600` |
+| `CHAT_CLEANUP_BATCH_SIZE` | 每批删除条数（防大事务） | `500` |
 
 **模型切换**：改 `.env` 里对应模型名 → `docker compose up -d --build backend` 重启生效（换模型须保证向量维度与 Milvus collection 一致）。模型文件缓存于 volume，切换后首次会重新下载。
 
@@ -363,7 +376,8 @@ good-question/
 │   ├── api/                  # 路由层（薄）：auth/dashboard/library/document/session/chat/contracts
 │   │   └── contracts.py      # GET /api/contracts 契约清单（评测平台自动发现）
 │   ├── services/             # 业务逻辑：document(管线) / retrieval(混合检索) / chat(问答/记忆/流式)
-│   │                         #          llama_store(LlamaIndex 隔离层) / rerank(精排+置信档)
+│   │                         #          chat_cleanup(会话过期清理) / llama_store(LlamaIndex 隔离层)
+│   │                         #          rerank(精排+置信档)
 │   │                         #          retrieval_types(接缝数据类) / vector_store(门面)
 │   │                         #          dashboard / library / auth / embedding / llm
 │   ├── scripts/              # migrate_to_milvus.py：从 MySQL chunks 幂等重灌 Milvus
@@ -371,8 +385,8 @@ good-question/
 │   ├── schemas/              # Pydantic 请求/响应
 │   ├── middleware/           # JWT 鉴权 Depends
 │   ├── utils/                # mineru_extractor / mineru_api / text_cleaner / chunker / security / exceptions
-│   ├── alembic/              # 数据库迁移（versions/：0001~0003）
-│   ├── tests/                # 单元测试（167 个测试函数，pytest 已内置镜像）
+│   ├── alembic/              # 数据库迁移（versions/：0001~0004）
+│   ├── tests/                # 单元测试（178 个测试函数，pytest 已内置镜像）
 │   ├── requirements.txt      # 生产依赖
 │   └── requirements-dev.txt  # 测试依赖（pytest，已装进镜像）
 ├── frontend/                 # Vue 3 + Naive UI 前端
@@ -398,7 +412,7 @@ good-question/
 
 | 层 | 内容 | 说明 |
 |----|------|------|
-| 单元测试 | `backend/tests/` 165 个测试函数 | 安全 / 清洗 / 切片（含跨页全局 section、@@PAGE 页码、章节 section_id）/ 文档服务（含 reprocess 双层防并发、删除失效缓存）/ embedding / 检索（含章节扩充、extra_filters 库隔离）/ 聊天服务（含五维度防注入、两级置信档边界、闲聊粗判、未命中固定话术、F3 规则否决权与豁免分支、LLM 空返回兜底、HTTP 错误显式化、缓存 key 规则化归一、首轮瞬时错误重试）/ chat_cache（key 隔离、模型维度、版本失效、熔断降级、SSE 重放事件序）/ llama_store（node↔hit、embedding 维度 fail-fast）/ api（断连检测），纯函数级，不依赖外部服务 |
+| 单元测试 | `backend/tests/` 178 个测试函数 | 安全 / 清洗 / 切片（含跨页全局 section、@@PAGE 页码、章节 section_id）/ 文档服务（含 reprocess 双层防并发、删除失效缓存）/ embedding / 检索（含章节扩充、extra_filters 库隔离）/ 聊天服务（含五维度防注入、两级置信档边界、闲聊粗判、未命中固定话术、F3 规则否决权与豁免分支、LLM 空返回兜底、HTTP 错误显式化、缓存 key 规则化归一、首轮瞬时错误重试）/ 会话清理（DB 侧 NOW() 判定、分批 sweep、惰性三落点）/ chat_cache（key 隔离、模型维度、版本失效、熔断降级、SSE 重放事件序）/ llama_store（node↔hit、embedding 维度 fail-fast）/ api（断连检测），纯函数级，不依赖外部服务 |
 | 契约验证 | `verify_contract.py` | 运行时读真实 SSE 事件流，断言事件序（meta 首、usage 在 done 前）与字段完整（meta/tool_call/usage/reasoning/token/ts）；`tool_call.status` 支持 ok/error（LLM 决策）与 rule_override/rule_override_error（三期规则否决） |
 | 迁移验证 | `test-data/e2e.py` / `chat.py` / `verify_old_data.py` | 登录→建库→上传→就绪 / chat 完整链路读 SSE / 旧数据重灌后检索验证 |
 | 前端构建 | `npm run build` | 改了前端代码必须先 build，否则 nginx 里是旧页面 |
@@ -511,6 +525,7 @@ python verify_contract.py                                          # 宿主机�
 
 | 版本 | 日期 | 核心内容 |
 |------|------|----------|
+| **2.2.0** | 2026-08-26 | 会话过期清理：超过保留期（最后活跃 `updated_at`）的会话物理删除，`chat_messages` 外键 CASCADE 级联；双机制——`SessionCleaner` 定时 sweep（asyncio 后台循环 + 分批删除防大事务）+ 查询时惰性清理（详情/聊天即删、列表过滤隐藏）；过期判定统一落 DB 侧 `NOW() - INTERVAL`（Python 不生成 cutoff，防容器/DB 时区错位）；`idx_updated_at` 索引迁移 0004；`CHAT_CLEANUP_ENABLED=false` 一键停 |
 | **2.1.1** | 2026-08-25 | 2.0.4 批次发布落地（打 tag 2.1.1）；前端长答案折叠"收起"失效修复——setup 内 ref 未自动解包，`!showFullAnswer` 恒 false 致 `collapsed` 类永不加，补 `.value` 修复 |
 | **2.0.4** | 2026-08-25 | 问答缓存精准化与对话可靠性加固：缓存 key 纳入 embedding/rerank 模型维度（换模型不串答案）+ 规则化 query 归一化（去客套/emoji/全角，相似问法命中率提升）+ 删除文档/删库即失效缓存；LLM 首轮瞬时错误（429/5xx）自动退避重试 1 次（仅未 yield 事件时整体重试）；章节级检索扩充（同章节兄弟 chunk 合并 context，sources 保持精排 top-3 精确引用）；前端"停止生成"（AbortController）+ 后端断连检测（客户端断开即终止 LLM 调用，不烧 token）；换 embedding 模型维度不匹配启动 fail-fast 报错提示重灌；修复 LLM 首轮返回多 tool_call 时未裁剪导致第二轮 400（assistant 只声明执行的第一个 tool_call，tool 消息与之对齐） |
 | **2.0.3** | 2026-08-25 | 长答案治理：system prompt 追加答案长度约束（常规问答 ≤200 字，总结/列举类 ≤600 字）+ 前端长答案折叠（超 500 字折叠，流式生成中始终展开）；README 彻底重排为新人友好结构，系统架构章补充"编排模式"主线（LLM 自主决策 + 规则否决 + 空结果兜底） |
