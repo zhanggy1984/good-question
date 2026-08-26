@@ -87,6 +87,8 @@ graph TB
     API -.辅助.-> ATTU
 ```
 
+**对外链路（统一 API 网关）**：浏览器只访问前端 nginx；nginx 将 `/api` 反代到共享网关 `api-gateway:8099`（`Host: gq.local`），网关按 Host 虚拟域名路由到本 agent 后端，并生成 `X-Request-ID`（后端日志 `trace_id` 即此值）、按真实 IP 限流、SSE 透传。网关由共享 infra 仓库提供（`infra/api-gateway/`），未知 Host 一律 403 防串线。宿主端口映射的 backend 地址（如 `localhost:8080`）仅供开发调试 / 评测直连，绕过网关。
+
 ### 编排模式：LLM 自主决策 + 规则护栏
 
 本系统**不是**"先检索、后作答"的固定流程，而是让 LLM 自主决定"要不要查文档"，再由规则在三个关键口子上兜底：
