@@ -54,7 +54,10 @@
 graph TB
     subgraph 前端
         WEB["Vue3 + Naive UI<br/>（chat/dashboard/library/document）"]
-        NGINX["nginx :80<br/>静态服务 + /api 反代 + SSE 关缓冲（唯一对外入口）"]
+        NGINX["nginx :80<br/>静态服务 + /api 反代 → api-gateway + SSE 关缓冲（唯一对外入口）"]
+    end
+    subgraph 共享网关
+        GATEWAY["API 网关 api-gateway:8099（共享 infra）<br/>Host 虚拟域名路由 + X-Request-ID traceId<br/>按真实 IP 限流 + SSE 透传"]
     end
     subgraph 应用层
         API["backend FastAPI :8080<br/>认证 / 文档管线 / 混合检索 / 聊天流式"]
@@ -72,8 +75,9 @@ graph TB
     end
 
     WEB --> NGINX
-    NGINX --> API
-    API -- SSE 流式 --> WEB
+    NGINX --> GATEWAY
+    GATEWAY --> API
+    GATEWAY -- SSE 流式 --> WEB
     API --> MYSQL
     API --> LLAMAIX
     LLAMAIX --> MILVUS
@@ -525,6 +529,7 @@ python verify_contract.py                                          # 宿主机�
 
 | 版本 | 日期 | 核心内容 |
 |------|------|----------|
+| **2.3.0** | 2026-08-26 | 统一 API 网关接入：前端 nginx 改反代共享网关 `api-gateway:8099`（Host: gq.local），网关负责 X-Request-ID traceId 根生成（后端日志 `trace_id` 对齐）、按真实 IP 限流（gq_chat 2r/s）、SSE 透传 |
 | **2.2.0** | 2026-08-26 | 会话过期清理：超过保留期（最后活跃 `updated_at`）的会话物理删除，`chat_messages` 外键 CASCADE 级联；双机制——`SessionCleaner` 定时 sweep（asyncio 后台循环 + 分批删除防大事务）+ 查询时惰性清理（详情/聊天即删、列表过滤隐藏）；过期判定统一落 DB 侧 `NOW() - INTERVAL`（Python 不生成 cutoff，防容器/DB 时区错位）；`idx_updated_at` 索引迁移 0004；`CHAT_CLEANUP_ENABLED=false` 一键停 |
 | **2.1.1** | 2026-08-25 | 2.0.4 批次发布落地（打 tag 2.1.1）；前端长答案折叠"收起"失效修复——setup 内 ref 未自动解包，`!showFullAnswer` 恒 false 致 `collapsed` 类永不加，补 `.value` 修复 |
 | **2.0.4** | 2026-08-25 | 问答缓存精准化与对话可靠性加固：缓存 key 纳入 embedding/rerank 模型维度（换模型不串答案）+ 规则化 query 归一化（去客套/emoji/全角，相似问法命中率提升）+ 删除文档/删库即失效缓存；LLM 首轮瞬时错误（429/5xx）自动退避重试 1 次（仅未 yield 事件时整体重试）；章节级检索扩充（同章节兄弟 chunk 合并 context，sources 保持精排 top-3 精确引用）；前端"停止生成"（AbortController）+ 后端断连检测（客户端断开即终止 LLM 调用，不烧 token）；换 embedding 模型维度不匹配启动 fail-fast 报错提示重灌；修复 LLM 首轮返回多 tool_call 时未裁剪导致第二轮 400（assistant 只声明执行的第一个 tool_call，tool 消息与之对齐） |

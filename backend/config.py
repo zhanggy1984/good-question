@@ -24,6 +24,9 @@ class Settings(BaseSettings):
     deepseek_api_key: str = "sk-xxx"
     deepseek_base_url: str = "https://api.deepseek.com/v1"
     deepseek_model: str = "deepseek-chat"
+    # 思考过程开关：deepseek-chat 默认不返回 reasoning_content，须显式开启 thinking
+    # 才输出思考过程（V3.1+ 支持）。开启会额外计费思考 token、延迟略增，需关时设 false 即可。
+    deepseek_thinking_enabled: bool = True
     # 首轮 LLM 瞬时错误（429/5xx）重试：仅限首轮且未流出任何事件时整体重试（可用性提升）；
     # 第二轮失败时首轮事件已发出，无法整体重试，直接报错（不在此列）。
     # chat_llm_max_attempts 是"总调用次数上限（含首次）"：默认 2 = 首次失败后重试 1 次。

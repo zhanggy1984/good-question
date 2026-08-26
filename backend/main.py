@@ -1,5 +1,6 @@
 """Native RAG - FastAPI 应用入口"""
 import logging
+import uuid
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
@@ -11,12 +12,14 @@ from config import settings
 from database import SessionLocal
 from services import auth_service
 from utils.exceptions import AppError
+from utils.trace import install, trace_id_var
 
-# 日志配置
+# 日志配置（[%(trace_id)s]：链路追踪，值来自中间件注入的 X-Request-ID，见 utils/trace.py）
 logging.basicConfig(
     level=logging.DEBUG,
-    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    format="%(asctime)s %(levelname)s %(name)s: [%(trace_id)s] %(message)s",
 )
+install()
 logger = logging.getLogger("native_rag")
 
 
@@ -92,6 +95,17 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def trace_middleware(request: Request, call_next):
+    """链路追踪：取网关透传的 X-Request-ID（无则生成 uuid），写入 contextvar 供日志
+    filter 使用，并在响应头回传（经网关时网关会隐藏后端重复头，无副作用）。"""
+    rid = request.headers.get("X-Request-ID") or uuid.uuid4().hex
+    trace_id_var.set(rid)
+    response = await call_next(request)
+    response.headers.setdefault("X-Request-ID", rid)
+    return response
 
 
 @app.exception_handler(AppError)

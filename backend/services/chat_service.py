@@ -625,9 +625,13 @@ def _stream_deepseek(messages: list[dict], tools: list[dict] | None = None):
         "messages": messages,
         "stream": True,
         "temperature": 0.3,
-        # 评测契约要求透出真实 token 消耗；DeepSeek 流式默认不返回 usage，须显式开启
+        # 思考过程开关：deepseek-chat 默认不返回 reasoning_content，开启 thinking 才输出
+        #（前端"💭 思考过程"折叠块依赖 reasoning 事件）。deepseek-reasoner 恒返回，不受影响。
+        # 条件构建避免传 "thinking": None 被 API 拒绝。
         "stream_options": {"include_usage": True},
     }
+    if settings.deepseek_thinking_enabled:
+        payload["thinking"] = {"type": "enabled"}
     if tools:
         payload["tools"] = tools  # 不设 tool_choice，默认 auto，由 LLM 自主决定
     headers = {
