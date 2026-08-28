@@ -52,40 +52,42 @@
 
 ```mermaid
 graph TB
-    subgraph 前端
-        WEB["Vue3 + Naive UI<br/>（chat/dashboard/library/document）"]
-        NGINX["nginx :80<br/>静态服务 + /api 反代 → api-gateway + SSE 关缓冲（唯一对外入口）"]
+    subgraph 客户端入口
+        WEB["浏览器<br/>Vue3 + Naive UI"]
+        NGINX["nginx :80<br/>静态服务 + /api 反代 → 网关"]
+        GATEWAY["API 网关 :8099（共享 infra）<br/>Host 虚拟域名路由 + traceId + 限流 + SSE 透传"]
     end
-    subgraph 共享网关
-        GATEWAY["API 网关 api-gateway:8099（共享 infra）<br/>Host 虚拟域名路由 + X-Request-ID traceId<br/>按真实 IP 限流 + SSE 透传"]
+    subgraph 后端四层架构
+        L1["交互层 api/ + schemas/ + middleware/<br/>backend FastAPI :8080 · 路由/鉴权/解析/格式化"]
+        L2["控制层 chat_service<br/>意图理解 · 会话状态 · 任务编排 · SSE 事件流"]
+        L3["能力层 document · library · auth<br/>dashboard · retrieval"]
+        L4["资源层 llm · embedding · rerank · vector_store<br/>llama_store · chat_cache · chat_cleanup"]
+        L5["基础设施 models/ · utils/ · config.py<br/>ORM · 纯函数工具 · 配置"]
     end
-    subgraph 应用层
-        API["backend FastAPI :8080<br/>认证 / 文档管线 / 混合检索 / 聊天流式"]
-    end
-    subgraph AI 服务
+    subgraph 外部依赖
         DS["DeepSeek LLM<br/>生成 / 思考 / 记忆压缩"]
-        LLAMAIX["LlamaIndex 0.12<br/>切片 / 索引 / 混合检索 / 重排"]
-        EMBED["FastEmbed jina-embeddings-v2-base-zh 768 维<br/>+ BGE-M3 学习稀疏（CPU）"]
-        RERANK["BGE-Reranker v2-m3<br/>精排（CPU）"]
-    end
-    subgraph 数据层
+        MILVUS[(Milvus 2.5 Standalone<br/>dense + BGE-M3 稀疏混合检索<br/>etcd + MinIO)]
         MYSQL[(MySQL 8<br/>用户/文档/切片/会话/消息)]
-        MILVUS[(Milvus 2.5 Standalone<br/>dense + sparse 双路混合检索<br/>依赖 etcd + MinIO)]
-        ATTU["Attu :8000<br/>Milvus 可视化管理 UI"]
+        REDIS[(Redis<br/>问答缓存 / 登录限流)]
     end
 
     WEB --> NGINX
     NGINX --> GATEWAY
-    GATEWAY --> API
     GATEWAY -- SSE 流式 --> WEB
-    API --> MYSQL
-    API --> LLAMAIX
-    LLAMAIX --> MILVUS
-    LLAMAIX --> EMBED
-    LLAMAIX --> RERANK
-    API --> DS
-    API -.辅助.-> ATTU
+    GATEWAY --> L1
+    L1 --> L2
+    L1 --> L3
+    L2 --> L3
+    L2 --> L4
+    L3 --> L4
+    L4 --> L5
+    L4 --> DS
+    L4 --> MILVUS
+    L5 --> MYSQL
+    L4 --> REDIS
 ```
+
+> 箭头即**调用方向**：客户端请求经 nginx → 网关 → 交互层逐层下钻（分层依赖自交互层单向到资源层/基础设施），结果自下而上经 SSE 返回；DeepSeek/Milvus/MySQL/Redis 等外部依赖由资源层与基础设施访问。
 
 **对外链路（统一 API 网关）**：浏览器只访问前端 nginx；nginx 将 `/api` 反代到共享网关 `api-gateway:8099`（`Host: gq.local`），网关按 Host 虚拟域名路由到本 agent 后端，并生成 `X-Request-ID`（后端日志 `trace_id` 即此值）、按真实 IP 限流、SSE 透传。网关由共享 infra 仓库提供（`infra/api-gateway/`），未知 Host 一律 403 防串线。宿主端口映射的 backend 地址（如 `localhost:8080`）仅供开发调试 / 评测直连，绕过网关。
 
@@ -119,7 +121,7 @@ graph TB
 
 ### 后端代码分层：四层单向依赖
 
-部署拓扑见上图；代码组织上同样做了分层约束——按"是否有业务语义"把 `services/` 切成四层，依赖单向、边界可测，让控制层只编排不干活，能力层承载业务操作，资源层向外部依赖抽象。
+上图一张图同时表达**对外链路**（客户端 → 网关 → 后端）与**后端四层代码分层**；代码组织按"是否有业务语义"切四层，依赖单向、边界可测，让控制层只编排不干活，能力层承载业务操作，资源层向外部依赖抽象。
 
 **各层职责与模块归属：**
 
@@ -131,35 +133,7 @@ graph TB
 | 资源层 | `llm/embedding/rerank/vector_store/llama_store/chat_cache/chat_cleanup/retrieval_types` | 无业务语义的基础设施，向 LLM/向量库/缓存/存储抽象 |
 | 基础设施 | `models/` · `utils/` · `config.py` | ORM、纯函数工具、配置 |
 
-**依赖方向（箭头即"可依赖"）：**
-
-```mermaid
-graph TB
-    subgraph 交互层
-        I["api/ · schemas/ · middleware/<br/>路由 / 鉴权 / 请求解析 / 响应格式化"]
-    end
-    subgraph 控制层
-        C["chat_service<br/>意图理解 · 会话状态 · 任务编排 · SSE 事件流组装"]
-    end
-    subgraph 能力层
-        P["document · library · auth<br/>dashboard · retrieval"]
-    end
-    subgraph 资源层
-        R["llm · embedding · rerank · vector_store<br/>llama_store · chat_cache · chat_cleanup<br/>retrieval_types"]
-    end
-    subgraph 基础设施
-        F["models/ · utils/ · config.py<br/>ORM · 纯函数工具 · 配置"]
-    end
-
-    I --> C
-    I --> P
-    C --> P
-    C --> R
-    P --> R
-    R --> F
-```
-
-三条规则：**单向**（上层可依赖下层，下层绝不依赖上层，`services/` 任何模块不得 `import api/`）；**依赖抽象不依赖实现**（控制层只调能力层/资源层的公开接口编排，如检索工具 `execute_retrieve_tool` 是能力层对外契约）；**数据流单向**（请求自交互层逐层下钻，结果自下而上返回）。
+分层结构与调用方向见上图"后端四层架构"子图。三条依赖规则：**单向**（上层可依赖下层，下层绝不依赖上层，`services/` 任何模块不得 `import api/`）；**依赖抽象不依赖实现**（控制层只调能力层/资源层的公开接口编排，如检索工具 `execute_retrieve_tool` 是能力层对外契约）；**数据流单向**（请求自交互层逐层下钻，结果自下而上返回）。
 
 依赖方向不是写死在文档里，而是被测试守护：`tests/test_architecture.py` 用 AST 静态解析 `services/` 全部模块的 import，四条规则（反向依赖禁止 / 资源层不依赖上层 / 能力层不依赖控制层 / 全部模块已归层）任一违反即测试失败——新增服务不归层、依赖方向错了，提交即被拦。
 
