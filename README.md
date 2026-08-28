@@ -22,7 +22,6 @@
 - [十、开发指南](#十开发指南)
 - [十一、常见问题](#十一常见问题)
 - [十二、已知限制与优化方向](#十二已知限制与优化方向)
-- [十三、版本记录](#十三版本记录)
 
 ---
 
@@ -54,15 +53,22 @@
 graph TB
     subgraph 客户端入口
         WEB["浏览器<br/>Vue3 + Naive UI"]
-        NGINX["nginx :80<br/>静态服务 + /api 反代 → 网关"]
+        NGINX["nginx :80（宿主 :8089）<br/>静态服务 + /api 反代 → 网关 + SSE 关缓冲"]
         GATEWAY["API 网关 :8099（共享 infra）<br/>Host 虚拟域名路由 + traceId + 限流 + SSE 透传"]
     end
     subgraph 后端四层架构
-        L1["交互层 api/ + schemas/ + middleware/<br/>backend FastAPI :8080 · 路由/鉴权/解析/格式化"]
-        L2["控制层 chat_service<br/>意图理解 · 会话状态 · 任务编排 · SSE 事件流"]
-        L3["能力层 document · library · auth<br/>dashboard · retrieval"]
-        L4["资源层 llm · embedding · rerank · vector_store<br/>llama_store · chat_cache · chat_cleanup"]
-        L5["基础设施 models/ · utils/ · config.py<br/>ORM · 纯函数工具 · 配置"]
+        subgraph 交互层["交互层 api/ + schemas/ + middleware/"]
+            L1["backend FastAPI :8080<br/>路由 · 鉴权 · 请求解析 · 响应格式化（薄）"]
+        end
+        subgraph 控制层["控制层 services/chat_service.py"]
+            L2["意图理解 · 会话状态 · 任务编排 · SSE 事件流组装"]
+        end
+        subgraph 能力层["能力层 services/"]
+            L3["document · library · auth · dashboard · retrieval<br/>有业务语义的操作"]
+        end
+        subgraph 资源层["资源层 services/ + models/ + utils/"]
+            L4["llm · embedding · rerank · vector_store · llama_store<br/>chat_cache · chat_cleanup · retrieval_types<br/>ORM · 纯函数工具 · 配置"]
+        end
     end
     subgraph 外部依赖
         DS["DeepSeek LLM<br/>生成 / 思考 / 记忆压缩"]
@@ -76,18 +82,15 @@ graph TB
     GATEWAY -- SSE 流式 --> WEB
     GATEWAY --> L1
     L1 --> L2
-    L1 --> L3
     L2 --> L3
-    L2 --> L4
     L3 --> L4
-    L4 --> L5
     L4 --> DS
     L4 --> MILVUS
-    L5 --> MYSQL
+    L4 --> MYSQL
     L4 --> REDIS
 ```
 
-> 箭头即**调用方向**：客户端请求经 nginx → 网关 → 交互层逐层下钻（分层依赖自交互层单向到资源层/基础设施），结果自下而上经 SSE 返回；DeepSeek/Milvus/MySQL/Redis 等外部依赖由资源层与基础设施访问。
+> 箭头即**调用方向**：客户端请求经 nginx → 网关 → 交互层，**单向逐层下钻**（交互 → 控制 → 能力 → 资源，控制层不直连资源层、经能力层编排），结果自下而上经 SSE 返回；DeepSeek / Milvus / MySQL / Redis 等外部依赖仅由资源层访问。
 
 **对外链路（统一 API 网关）**：浏览器只访问前端 nginx；nginx 将 `/api` 反代到共享网关 `api-gateway:8099`（`Host: gq.local`），网关按 Host 虚拟域名路由到本 agent 后端，并生成 `X-Request-ID`（后端日志 `trace_id` 即此值）、按真实 IP 限流、SSE 透传。网关由共享 infra 仓库提供（`infra/api-gateway/`），未知 Host 一律 403 防串线。宿主端口映射的 backend 地址（如 `localhost:8080`）仅供开发调试 / 评测直连，绕过网关。
 
@@ -130,14 +133,15 @@ graph TB
 | 交互层 | `api/` + `schemas/` + `middleware/` | 路由、鉴权、请求解析、响应格式化（薄） |
 | 控制层 | `services/chat_service.py` | 意图理解、会话状态、任务编排、SSE 事件流组装 |
 | 能力层 | `document/library/auth/dashboard/retrieval` | 有业务语义的操作：文档生命周期、知识库管理、检索编排 |
-| 资源层 | `llm/embedding/rerank/vector_store/llama_store/chat_cache/chat_cleanup/retrieval_types` | 无业务语义的基础设施，向 LLM/向量库/缓存/存储抽象 |
-| 基础设施 | `models/` · `utils/` · `config.py` | ORM、纯函数工具、配置 |
+| 资源层 | `llm/embedding/rerank/vector_store/llama_store/chat_cache/chat_cleanup/retrieval_types` + `models/` + `utils/` + `config.py` | 无业务语义的基础设施，向 LLM/向量库/缓存/ORM/配置抽象 |
 
-分层结构与调用方向见上图"后端四层架构"子图。三条依赖规则：**单向**（上层可依赖下层，下层绝不依赖上层，`services/` 任何模块不得 `import api/`）；**依赖抽象不依赖实现**（控制层只调能力层/资源层的公开接口编排，如检索工具 `execute_retrieve_tool` 是能力层对外契约）；**数据流单向**（请求自交互层逐层下钻，结果自下而上返回）。
+分层结构与调用方向见上图"后端四层架构"子图。三条依赖规则：**单向**（上层可依赖下层，下层绝不依赖上层，`services/` 任何模块不得 `import api/`）；**依赖抽象不依赖实现**（控制层只调能力层的公开接口编排，如检索工具 `execute_retrieve_tool` 是能力层对外契约，不直连资源层）；**数据流单向**（请求自交互层逐层下钻，结果自下而上返回）。
 
 依赖方向不是写死在文档里，而是被测试守护：`tests/test_architecture.py` 用 AST 静态解析 `services/` 全部模块的 import，四条规则（反向依赖禁止 / 资源层不依赖上层 / 能力层不依赖控制层 / 全部模块已归层）任一违反即测试失败——新增服务不归层、依赖方向错了，提交即被拦。
 
-分层是随重构逐步收敛的，不是一次性设计：检索结果组装（`execute_retrieve_tool`）下沉到能力层、LLM 流式解析与重试（`stream_chat`/`stream_round1_with_retry`）下沉到资源层、query 规则化清洗（`utils/query_normalizer`）下沉到基础设施层之后，控制层 `chat_service` 才收敛为纯编排——每轮下沉同步迁移对应单测，行为零变化（212 项单测全绿）。
+分层是随重构逐步收敛的，不是一次性设计：检索结果组装（`execute_retrieve_tool`）下沉到能力层、LLM 流式解析与重试（`stream_chat`/`stream_round1_with_retry`）下沉到资源层、query 规则化清洗（`utils/query_normalizer`）下沉到资源层之后，控制层 `chat_service` 才收敛为纯编排——每轮下沉同步迁移对应单测，行为零变化（212 项单测全绿）。
+
+**收敛状态（如实）**：上图为**依赖规则（目标架构）**。当前控制层 `chat_service` 仍直连资源层 `llm_service` / `chat_cache` / `chat_cleanup`，交互层 `api/` 仍直连 `services` 与 `models`——这些越层调用正随重构逐项下沉到能力层，收敛后依赖严格为 交互→控制→能力→资源 单向、控制层不直连资源层。`tests/test_architecture.py` 守护的当前基线（反向依赖禁止 / 资源层不依赖上层 / 能力层不依赖控制层 / 全部模块已归层）将随收敛逐步收紧。
 
 ---
 
@@ -555,23 +559,6 @@ python verify_contract.py                                          # 宿主机�
    - 可选方向：GPU 推理、更小的 rerank 模型、或更激进的候选控制（均已评估，各有取舍，尚未落地）。
 2. **模型全 CPU 推理**：embedding、稀疏编码与 rerank 均为 CPU，重负载场景可考虑 GPU 容器。
 3. **问答缓存仅精确命中（query 已规则化归一）**：Redis 缓存 key 为"库 + 模型维度 + 规则化 query"——key 纳入 LLM/embedding/rerank 三个模型名（换模型不串答案），query 经规则化归一（剥离客套/emoji、全角转半角）提升相似问法命中率；语义相近或带多轮上下文变体的问题仍走完整调用（DeepSeek 计费）。高频率场景可评估语义级缓存。
-
----
-
-## 十三、版本记录
-
-| 版本 | 日期 | 核心内容 |
-|------|------|----------|
-| **2.4.0** | 2026-08-28 | 上线前安全加固：① 文档读接口限 admin（`list_documents`/`list_document_chunks`/`document_status` 改 `get_admin_user`，普通用户 API 层不再触及文档原文）+ `create_session` 补库存在性校验；② 登录防爆破：Redis 计数连续失败 5 次锁 15 分钟，429 统一错误码，Redis 故障 fail-open + 告警（限流器故障不锁死全员）；③ 安全默认值 fail-fast：JWT/Admin 密钥空或占位值启动即拒绝（不再允许 `change-me`/`admin123` 裸奔）；④ CORS 从 `*` 收紧为白名单；⑤ 安全响应头：`nosniff`/`X-Frame-Options`/`Referrer-Policy`/CSP（后端中间件一处覆盖 8080/8089）；⑥ TLS 在共享 infra 入口终止，本 nginx 仅走 80（不内置 HTTPS） |
-| **2.2.0** | 2026-08-26 | 会话过期清理：超过保留期（最后活跃 `updated_at`）的会话物理删除，`chat_messages` 外键 CASCADE 级联；双机制——`SessionCleaner` 定时 sweep（asyncio 后台循环 + 分批删除防大事务）+ 查询时惰性清理（详情/聊天即删、列表过滤隐藏）；过期判定统一落 DB 侧 `NOW() - INTERVAL`（Python 不生成 cutoff，防容器/DB 时区错位）；`idx_updated_at` 索引迁移 0004；`CHAT_CLEANUP_ENABLED=false` 一键停 |
-| **2.1.1** | 2026-08-25 | 2.0.4 批次发布落地（打 tag 2.1.1）；前端长答案折叠"收起"失效修复——setup 内 ref 未自动解包，`!showFullAnswer` 恒 false 致 `collapsed` 类永不加，补 `.value` 修复 |
-| **2.0.4** | 2026-08-25 | 问答缓存精准化与对话可靠性加固：缓存 key 纳入 embedding/rerank 模型维度（换模型不串答案）+ 规则化 query 归一化（去客套/emoji/全角，相似问法命中率提升）+ 删除文档/删库即失效缓存；LLM 首轮瞬时错误（429/5xx）自动退避重试 1 次（仅未 yield 事件时整体重试）；章节级检索扩充（同章节兄弟 chunk 合并 context，sources 保持精排 top-3 精确引用）；前端"停止生成"（AbortController）+ 后端断连检测（客户端断开即终止 LLM 调用，不烧 token）；换 embedding 模型维度不匹配启动 fail-fast 报错提示重灌；修复 LLM 首轮返回多 tool_call 时未裁剪导致第二轮 400（assistant 只声明执行的第一个 tool_call，tool 消息与之对齐） |
-| **2.0.3** | 2026-08-25 | 长答案治理：system prompt 追加答案长度约束（常规问答 ≤200 字，总结/列举类 ≤600 字）+ 前端长答案折叠（超 500 字折叠，流式生成中始终展开）；README 彻底重排为新人友好结构，系统架构章补充"编排模式"主线（LLM 自主决策 + 规则否决 + 空结果兜底） |
-| **2.0.2** | 2026-08-25 | Redis 问答缓存：精确 key（库+模型+问题 sha256）、连接熔断降级、库级失效、缓存命中 SSE 事件重放（事件序对齐真实流程 + `intent`/`non_doc_question` 透传防前端误示空命中）；Prompt 五维度法防注入 + 检索服务不可用兜底 + query 清洗；`tool_call` 检索三态透传（前端空命中/可信度偏低提示）；chunk 跨页全局 section 切分 + `@@PAGE` 页码标记 + 清洗增强；文档重新处理（reprocess）：failed/ready 重试、可选切分参数覆盖、双层防并发（内存原子占用 + DB status） |
-| **2.0.1** | 2026-08-24 | 三期 F3 规则否决权：LLM 决定不检索但规则判该查（query/unknown）时强制检索防编造；纯计算/常识豁免（`_is_non_doc_question`）；`rule_agree` 公式修正（unknown 纳入"该查"集合）；`tool_call.status` 新增 `rule_override`/`rule_override_error`；`tool_decision` 日志加 `rule_override`/`non_doc_question` 字段 |
-| **2.0** | 2026-08 | 二期 function calling 编排：LLM 自主决定是否检索 + 空结果规则意图兜底；SSE 事件流对齐评测契约 v1.0（`meta`/`tool_call`/`usage` + 全事件 `ts`）；`meta.git_sha` 构建注入；多轮记忆压缩；README 全面重写 |
-| **1.1** | — | 镜像内置测试依赖 pytest，容器内 pytest 开箱即用 |
-| **1.0** | — | 初始化：Native RAG 项目首次提交 |
 
 ---
 
