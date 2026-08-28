@@ -117,6 +117,54 @@ graph TB
   → ⑧ 前端按序渲染         溯源卡片 → 思考折叠 → 逐字答案 → 完成
 ```
 
+### 后端代码分层：四层单向依赖
+
+部署拓扑见上图；代码组织上同样做了分层约束——按"是否有业务语义"把 `services/` 切成四层，依赖单向、边界可测，让控制层只编排不干活，能力层承载业务操作，资源层向外部依赖抽象。
+
+**各层职责与模块归属：**
+
+| 层 | 模块 | 职责 |
+|----|------|------|
+| 交互层 | `api/` + `schemas/` + `middleware/` | 路由、鉴权、请求解析、响应格式化（薄） |
+| 控制层 | `services/chat_service.py` | 意图理解、会话状态、任务编排、SSE 事件流组装 |
+| 能力层 | `document/library/auth/dashboard/retrieval` | 有业务语义的操作：文档生命周期、知识库管理、检索编排 |
+| 资源层 | `llm/embedding/rerank/vector_store/llama_store/chat_cache/chat_cleanup/retrieval_types` | 无业务语义的基础设施，向 LLM/向量库/缓存/存储抽象 |
+| 基础设施 | `models/` · `utils/` · `config.py` | ORM、纯函数工具、配置 |
+
+**依赖方向（箭头即"可依赖"）：**
+
+```mermaid
+graph TB
+    subgraph 交互层
+        I["api/ · schemas/ · middleware/<br/>路由 / 鉴权 / 请求解析 / 响应格式化"]
+    end
+    subgraph 控制层
+        C["chat_service<br/>意图理解 · 会话状态 · 任务编排 · SSE 事件流组装"]
+    end
+    subgraph 能力层
+        P["document · library · auth<br/>dashboard · retrieval"]
+    end
+    subgraph 资源层
+        R["llm · embedding · rerank · vector_store<br/>llama_store · chat_cache · chat_cleanup<br/>retrieval_types"]
+    end
+    subgraph 基础设施
+        F["models/ · utils/ · config.py<br/>ORM · 纯函数工具 · 配置"]
+    end
+
+    I --> C
+    I --> P
+    C --> P
+    C --> R
+    P --> R
+    R --> F
+```
+
+三条规则：**单向**（上层可依赖下层，下层绝不依赖上层，`services/` 任何模块不得 `import api/`）；**依赖抽象不依赖实现**（控制层只调能力层/资源层的公开接口编排，如检索工具 `execute_retrieve_tool` 是能力层对外契约）；**数据流单向**（请求自交互层逐层下钻，结果自下而上返回）。
+
+依赖方向不是写死在文档里，而是被测试守护：`tests/test_architecture.py` 用 AST 静态解析 `services/` 全部模块的 import，四条规则（反向依赖禁止 / 资源层不依赖上层 / 能力层不依赖控制层 / 全部模块已归层）任一违反即测试失败——新增服务不归层、依赖方向错了，提交即被拦。
+
+分层是随重构逐步收敛的，不是一次性设计：检索结果组装（`execute_retrieve_tool`）下沉到能力层、LLM 流式解析与重试（`stream_chat`/`stream_round1_with_retry`）下沉到资源层、query 规则化清洗（`utils/query_normalizer`）下沉到基础设施层之后，控制层 `chat_service` 才收敛为纯编排——每轮下沉同步迁移对应单测，行为零变化（212 项单测全绿）。
+
 ---
 
 ## 三、快速开始
@@ -392,7 +440,8 @@ good-question/
 │   ├── models/               # SQLAlchemy ORM（6 张表）
 │   ├── schemas/              # Pydantic 请求/响应
 │   ├── middleware/           # JWT 鉴权 Depends
-│   ├── utils/                # mineru_extractor / mineru_api / text_cleaner / chunker / security / exceptions
+│   ├── utils/                # query_normalizer / text_cleaner / chunker / mineru_extractor / mineru_api
+│   │                         #   security / exceptions / trace / rate_limit
 │   ├── alembic/              # 数据库迁移（versions/：0001~0004）
 │   ├── tests/                # 单元测试（212 个测试函数，pytest 已内置镜像）
 │   ├── requirements.txt      # 生产依赖
@@ -412,13 +461,13 @@ good-question/
 └── data/                     # 上传文件存储（uploads/）
 ```
 
-**后端代码分层**（按"业务语义"切四层，依赖单向——上层可依赖下层，下层绝不依赖上层）：
+**后端代码分层**（按"是否有业务语义"切四层，依赖单向——下层绝不依赖上层；分层图与依赖规则详见[第二章](#二系统架构)）：
 - **交互层** `api/` + `schemas/`：路由、鉴权、请求解析、响应格式化（薄）；
 - **控制层** `services/chat_service.py`：意图理解、会话状态、任务编排、SSE 事件流组装；
-- **能力层** `services/{document,library,auth,dashboard,retrieval}_service.py`：有业务语义的具体操作（文档生命周期、知识库管理、检索编排）；
-- **资源层** `services/{llm,embedding,rerank,vector_store,llama_store,chat_cache,...}` + `models/` + `utils/`：无业务语义的基础设施（LLM/向量库/缓存/ORM/工具）。
+- **能力层** `services/{document,library,auth,dashboard,retrieval}_service.py`：有业务语义的操作（文档生命周期、知识库管理、检索编排）；
+- **资源层** `services/{llm,embedding,rerank,vector_store,llama_store,chat_cache,chat_cleanup,retrieval_types}` + `models/` + `utils/`：无业务语义的基础设施（LLM/向量库/缓存/ORM/工具）。
 
-依赖规则：资源层不得依赖上层，能力层不得依赖控制层，任何层不得依赖 `api/`。新增功能一般改 `api/` + 对应 service；新增服务须归层并保持依赖方向（`tests/test_architecture.py` 自动守护）。
+新增功能一般改 `api/` + 对应 service；新增服务须归层并保持依赖方向（`tests/test_architecture.py` 自动守护，违反即测试失败）。
 
 ---
 
