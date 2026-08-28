@@ -169,17 +169,6 @@ def test_is_low_confidence_boundaries():
     assert _is_low_confidence(high + 0.1) is False         # 高于高阈值：正常
 
 
-def test_confidence_band_three_band():
-    """二期置信档三档：none / low / high（tool_call result 与监控日志用）"""
-    low = settings.similarity_threshold_low
-    high = settings.rerank_low_confidence_threshold
-    assert cs._confidence_band(None) == "none"
-    assert cs._confidence_band(low - 0.01) == "none"
-    assert cs._confidence_band((low + high) / 2) == "low"
-    assert cs._confidence_band(high) == "high"
-    assert cs._confidence_band(high + 0.1) == "high"
-
-
 def test_clean_query():
     """清洗 LLM 生成的 query：去空白、空回退原文、超长按句末标点截断"""
     assert cs._clean_query("  工资发放日  ", "问题原文") == "工资发放日"
@@ -358,37 +347,6 @@ def test_knowledge_version_filters_by_library(monkeypatch):
     assert cs._knowledge_version(7) == ""
 
 
-def test_execute_retrieve_tool_structure(monkeypatch):
-    """_execute_retrieve_tool：包装 HybridRetriever，返回 context/sources/source_count/max_score/confidence_band
-
-    max_score 来自 rerank（numpy float32），必须转原生 float——json.dumps 不认 float32，
-    否则 tool_call SSE 事件与 JSON 日志序列化崩溃（曾线上复现）。
-    """
-    import numpy as np
-    from types import SimpleNamespace
-    chunk = SimpleNamespace(
-        content="内容内容内容",
-        metadata={"document_name": "测试.md", "heading_path": ["标题"], "chunk_index": 1, "total_chunks": 3},
-    )
-
-    class _Retriever:
-        max_rerank_score = np.float32(0.9)  # 模拟 rerank 返回的 numpy 标量
-        top_hits = []  # 章节扩充前未设置时退化为 invoke 结果（与 HybridRetriever.__init__ 契约一致）
-        def __init__(self, *a, **k):
-            pass
-        def invoke(self, q):
-            return [chunk]
-
-    monkeypatch.setattr(cs, "HybridRetriever", _Retriever)
-    r = cs._execute_retrieve_tool(7, "问题")
-    assert r["source_count"] == 1
-    assert r["confidence_band"] == "high"
-    assert isinstance(r["max_score"], float), "max_score 应转原生 float（numpy float32 不可 JSON 序列化）"
-    json.dumps({"source_count": r["source_count"], "max_score": r["max_score"]})  # 序列化不抛
-    assert r["sources"][0]["document_name"] == "测试.md"
-    assert "测试.md" in r["context"] and "内容内容内容" in r["context"]
-
-
 def test_json_log_outputs_json_line(monkeypatch):
     """_json_log：logger.info 输出含 kind/ts 的 JSON 行（结构化监控日志）"""
     captured = []
@@ -475,7 +433,7 @@ def _patch_chat_pipeline(monkeypatch, tool_result=None, round1=None, round2=None
     monkeypatch.setattr(cs, "_save_messages", lambda db, s, q, a, src: 1)
     monkeypatch.setattr(cs, "_compress_memory", lambda db, s: None)
     _patch_llm_stream(monkeypatch, _fake_stream)
-    monkeypatch.setattr(cs, "_execute_retrieve_tool", lambda library_id, query: tool_result)
+    monkeypatch.setattr(cs, "execute_retrieve_tool", lambda library_id, query: tool_result)
     monkeypatch.setattr(cs, "_json_log", lambda *a, **k: None)
     # 缓存隔离：默认未命中、不写（避免真实连 Redis）；meta 事件依赖打桩（避免子进程/DB 查询）
     monkeypatch.setattr(cs, "get_cached", lambda library_id, question: None)
@@ -859,7 +817,7 @@ def test_stream_chat_rule_override_error(monkeypatch):
     def _boom(library_id, query):
         raise RuntimeError("milvus down")
 
-    monkeypatch.setattr(cs, "_execute_retrieve_tool", _boom)
+    monkeypatch.setattr(cs, "execute_retrieve_tool", _boom)
     events = list(cs.stream_chat(1, "工资发放日是几号"))
     tc = next(d for t, d in events if t == "tool_call")
     assert tc["status"] == "rule_override_error"
@@ -882,7 +840,7 @@ def test_stream_chat_retrieve_error_llm_fallback(monkeypatch):
     def _boom(library_id, query):
         raise RuntimeError("milvus down")
 
-    monkeypatch.setattr(cs, "_execute_retrieve_tool", _boom)
+    monkeypatch.setattr(cs, "execute_retrieve_tool", _boom)
     events = list(cs.stream_chat(1, "工资发放日是几号"))
     types = [t for t, _ in events]
     assert types == ["meta", "tool_call", "token", "usage", "done"], f"实际 {types}"
@@ -975,7 +933,7 @@ def test_stream_chat_retrieve_error_not_cached(monkeypatch):
     def _boom(library_id, query):
         raise RuntimeError("milvus down")
 
-    monkeypatch.setattr(cs, "_execute_retrieve_tool", _boom)
+    monkeypatch.setattr(cs, "execute_retrieve_tool", _boom)
     monkeypatch.setattr(cs, "set_cached", lambda *a, **k: written.append(a))
     list(cs.stream_chat(1, "工资发放日是几号"))
     assert written == [], "Milvus 不可用时的兜底回答不应写缓存"
@@ -1034,7 +992,7 @@ def test_stream_chat_cache_hit_replays_not_found(monkeypatch):
         raise AssertionError("缓存命中不应查 Milvus")
 
     _patch_llm_stream(monkeypatch, _should_not_call)
-    monkeypatch.setattr(cs, "_execute_retrieve_tool", _should_not_query)
+    monkeypatch.setattr(cs, "execute_retrieve_tool", _should_not_query)
     monkeypatch.setattr(cs, "get_cached", lambda library_id, question: cached)
     events = list(cs.stream_chat(1, "工资发放日是几号"))
     types = [t for t, _ in events]
@@ -1143,28 +1101,6 @@ def test_stream_chat_cache_write_uses_normalized_query(monkeypatch):
     monkeypatch.setattr(cs, "set_cached", lambda library_id, question, payload: written.append((library_id, question)))
     list(cs.stream_chat(1, "请问一下工资发放日是几号，谢谢"))
     assert written == [(7, "工资发放日是几号")], f"写入 key 应归一化（去前缀/后缀/尾标点），实际 {written}"
-
-
-def test_execute_retrieve_tool_sources_from_top_hits(monkeypatch):
-    """章节扩充后：sources 取精排 top-3（top_hits）保引用精度，source_count 取扩充后 context 量"""
-    from types import SimpleNamespace
-    top1 = SimpleNamespace(content="A", metadata={"document_name": "a.md", "chunk_index": 0})
-    top2 = SimpleNamespace(content="B", metadata={"document_name": "a.md", "chunk_index": 1})
-    expanded = [top1, top2, SimpleNamespace(content="C", metadata={"document_name": "a.md", "chunk_index": 2})]
-
-    class _Retriever:
-        def __init__(self, *a, **k):
-            self.max_rerank_score = 0.8
-            self.top_hits = [top1, top2]
-
-        def invoke(self, q):
-            return expanded
-
-    monkeypatch.setattr(cs, "HybridRetriever", _Retriever)
-    r = cs._execute_retrieve_tool(7, "问题")
-    assert r["source_count"] == 3, "source_count 应取扩充后 context 量（与 [来源N] 编号一致）"
-    assert len(r["sources"]) == 2, "sources 应精确指向精排 top-3 小节，不随扩充稀释"
-    assert [s["chunk_index"] for s in r["sources"]] == [0, 1]
 
 
 # ════════ P0 附带校验：create_session 库存在性 ════════

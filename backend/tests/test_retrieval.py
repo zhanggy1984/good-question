@@ -10,8 +10,10 @@ sys.path.insert(0, "/app")
 
 from llama_index.core.vector_stores.types import VectorStoreQueryMode  # noqa: E402
 
+from config import settings  # noqa: E402
 from services.llama_store import COLLECTION_NAME  # noqa: E402
-from services.retrieval_service import HybridRetriever, _hits_to_chunks  # noqa: E402
+from services import retrieval_service as rs  # noqa: E402
+from services.retrieval_service import HybridRetriever, _hits_to_chunks, execute_retrieve_tool  # noqa: E402
 from services.retrieval_types import RetrievedChunk  # noqa: E402
 from services.vector_store_service import (  # noqa: E402
     add_chunks,
@@ -212,3 +214,71 @@ def test_expand_section_context_respects_total_cap(monkeypatch):
         retriever = HybridRetriever(library_id=1)
         merged = retriever._expand_section_context("查询", top)
     assert len(merged) == 3, "扩充后应受总量上限截断"
+
+
+# ════════ 检索工具结果组装（由 chat_service 下沉，随函数迁移） ════════
+
+
+def test_execute_retrieve_tool_structure(monkeypatch):
+    """execute_retrieve_tool：包装 HybridRetriever，返回 context/sources/source_count/max_score/confidence_band
+
+    max_score 来自 rerank（numpy float32），必须转原生 float——json.dumps 不认 float32，
+    否则 tool_call SSE 事件与 JSON 日志序列化崩溃（曾线上复现）。
+    """
+    import json
+    import numpy as np
+    from types import SimpleNamespace
+    chunk = SimpleNamespace(
+        content="内容内容内容",
+        metadata={"document_name": "测试.md", "heading_path": ["标题"], "chunk_index": 1, "total_chunks": 3},
+    )
+
+    class _Retriever:
+        max_rerank_score = np.float32(0.9)  # 模拟 rerank 返回的 numpy 标量
+        top_hits = []  # 章节扩充前未设置时退化为 invoke 结果（与 HybridRetriever.__init__ 契约一致）
+        def __init__(self, *a, **k):
+            pass
+        def invoke(self, q):
+            return [chunk]
+
+    monkeypatch.setattr(rs, "HybridRetriever", _Retriever)
+    r = rs.execute_retrieve_tool(7, "问题")
+    assert r["source_count"] == 1
+    assert r["confidence_band"] == "high"
+    assert isinstance(r["max_score"], float), "max_score 应转原生 float（numpy float32 不可 JSON 序列化）"
+    json.dumps({"source_count": r["source_count"], "max_score": r["max_score"]})  # 序列化不抛
+    assert r["sources"][0]["document_name"] == "测试.md"
+    assert "测试.md" in r["context"] and "内容内容内容" in r["context"]
+
+
+def test_execute_retrieve_tool_sources_from_top_hits(monkeypatch):
+    """章节扩充后：sources 取精排 top-3（top_hits）保引用精度，source_count 取扩充后 context 量"""
+    from types import SimpleNamespace
+    top1 = SimpleNamespace(content="A", metadata={"document_name": "a.md", "chunk_index": 0})
+    top2 = SimpleNamespace(content="B", metadata={"document_name": "a.md", "chunk_index": 1})
+    expanded = [top1, top2, SimpleNamespace(content="C", metadata={"document_name": "a.md", "chunk_index": 2})]
+
+    class _Retriever:
+        def __init__(self, *a, **k):
+            self.max_rerank_score = 0.8
+            self.top_hits = [top1, top2]
+
+        def invoke(self, q):
+            return expanded
+
+    monkeypatch.setattr(rs, "HybridRetriever", _Retriever)
+    r = rs.execute_retrieve_tool(7, "问题")
+    assert r["source_count"] == 3, "source_count 应取扩充后 context 量（与 [来源N] 编号一致）"
+    assert len(r["sources"]) == 2, "sources 应精确指向精排 top-3 小节，不随扩充稀释"
+    assert [s["chunk_index"] for s in r["sources"]] == [0, 1]
+
+
+def test_confidence_band_three_band():
+    """二期置信档三档：none / low / high（tool_call result 与监控日志用）"""
+    low = settings.similarity_threshold_low
+    high = settings.rerank_low_confidence_threshold
+    assert rs._confidence_band(None) == "none"
+    assert rs._confidence_band(low - 0.01) == "none"
+    assert rs._confidence_band((low + high) / 2) == "low"
+    assert rs._confidence_band(high) == "high"
+    assert rs._confidence_band(high + 0.1) == "high"

@@ -23,7 +23,7 @@ from services.llm_service import (
     stream_chat as llm_stream_chat,
     stream_round1_with_retry as llm_stream_round1_with_retry,
 )
-from services.retrieval_service import HybridRetriever
+from services.retrieval_service import execute_retrieve_tool
 from utils.exceptions import ForbiddenError, NotFoundError
 
 logger = logging.getLogger("native_rag")
@@ -388,19 +388,6 @@ def _compress_memory(db: Session, session: ChatSession) -> None:
 
 # ════════ RAG 链 ════════
 
-def _format_docs(docs) -> str:
-    """检索结果格式化为 prompt 的 context（带来源编号）"""
-    parts = []
-    for i, doc in enumerate(docs, 1):
-        meta = doc.metadata
-        src = f"[来源{i}] {meta.get('document_name', '未知文档')}"
-        heading = [h for h in (meta.get("heading_path") or []) if h]
-        if heading:
-            src += f" > {' > '.join(heading)}"
-        parts.append(f"{src}\n{doc.content}")
-    return "\n\n---\n\n".join(parts)
-
-
 # 检索 query 清洗参数：上限（防 LLM 把整段对话/上下文照抄进 query）；BGE 模型 512 token
 # 上限内 400 字安全，且给"整段制度条款引用"留足空间（200 会切断完整句子）
 _QUERY_MAX_LEN = 400
@@ -618,47 +605,6 @@ def _json_log(kind: str, **fields) -> None:
     logger.info(json.dumps({"ts": _ts(), "kind": kind, **fields}, ensure_ascii=False))
 
 
-def _confidence_band(max_score: float | None) -> str:
-    """检索置信档三档：none（无分/低于 LOW 视为无关）｜low（[LOW, 低置信阈值) 相关性存疑）｜high"""
-    if max_score is None or max_score < settings.similarity_threshold_low:
-        return "none"
-    if max_score < settings.rerank_low_confidence_threshold:
-        return "low"
-    return "high"
-
-
-def _execute_retrieve_tool(library_id: int, query: str) -> dict:
-    """执行 hybrid_retrieve 工具：检索 + 组装 LLM 上下文与 SSE sources
-
-    返回 dict：context（[来源N] 格式化，供第二轮 LLM 的 tool 消息）、sources（前端引用卡片）、
-    source_count / max_score / confidence_band（tool_call 事件 result 与监控日志用）
-    """
-    retriever = HybridRetriever(library_id=library_id)
-    chunks = retriever.invoke(query)  # 章节扩充后的 context（含同节兄弟 chunk）
-    max_score = retriever.max_rerank_score
-    # sources 保持精排 top-3 精确小节：章节扩充只扩大喂 LLM 的 context，不稀释引用精度
-    top_hits = retriever.top_hits or chunks
-    sources = [
-        {
-            "document_name": c.metadata.get("document_name", "未知文档"),
-            "heading_path": [h for h in (c.metadata.get("heading_path") or []) if h],
-            "chunk_content": c.content[:200],
-            "chunk_index": c.metadata.get("chunk_index"),
-            "total_chunks": c.metadata.get("total_chunks"),
-            "page_range": c.metadata.get("page_range") or [0, 0],
-        }
-        for c in top_hits
-    ]
-    return {
-        "context": _format_docs(chunks),
-        "sources": sources,
-        "source_count": len(chunks),  # 与 context 的 [来源N] 编号一致（LLM 视角的上下文量）
-        # rerank 返回 numpy float32，进 SSE tool_call result 与 JSON 日志须转原生 float（json.dumps 不认 float32）
-        "max_score": float(max_score) if max_score is not None else None,
-        "confidence_band": _confidence_band(max_score),
-    }
-
-
 # ════════ 流式聊天 ════════
 
 def _replay_cached(db: Session, session: ChatSession, user_content: str, cached: dict):
@@ -792,7 +738,7 @@ def stream_chat(session_id: int, user_content: str):
             try:
                 args = json.loads(tool_calls[0]["function"]["arguments"] or "{}")
                 query = _clean_query(args.get("query"), user_content)
-                result = _execute_retrieve_tool(session.library_id, query)
+                result = execute_retrieve_tool(session.library_id, query)
                 status = "ok"
             except Exception as e:
                 logger.warning("[chat] 检索工具执行失败: %s", e)
@@ -925,7 +871,7 @@ def stream_chat(session_id: int, user_content: str):
             # 原文 query 同样走规则化清洗（客套/全角/emoji 噪音），与 LLM 生成路径一致
             query = _clean_query(user_content, user_content)
             try:
-                result = _execute_retrieve_tool(session.library_id, query)
+                result = execute_retrieve_tool(session.library_id, query)
                 status = "rule_override"
             except Exception as e:
                 logger.warning("[chat] 规则否决检索失败: %s", e)
