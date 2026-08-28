@@ -14,7 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import pytest
 
-from config import Settings
+from config import Settings, settings
 
 _TEST_VALUE = "a-test-only-value"
 
@@ -39,3 +39,43 @@ def test_database_url_uses_env_injected_shared_account(monkeypatch):
     assert s.database_url == (
         f"mysql+pymysql://native_rag_user:{_TEST_VALUE}@mysql:3306/native_rag?charset=utf8mb4"
     )
+
+
+# ── 安全默认值 fail-fast（main._validate_secrets）──
+
+
+def test_validate_secrets_rejects_weak_defaults(monkeypatch):
+    """JWT/Admin 密钥为占位默认值时应 fail-fast（禁止裸奔启动）"""
+    from main import _validate_secrets
+    monkeypatch.setattr(settings, "jwt_secret_key", "change-me")
+    monkeypatch.setattr(settings, "admin_password", "admin123")
+    with pytest.raises(RuntimeError, match="JWT_SECRET_KEY"):
+        _validate_secrets()
+
+
+def test_validate_secrets_rejects_empty(monkeypatch):
+    """Admin 密钥为空时也应 fail-fast（缺配视为未配置）"""
+    from main import _validate_secrets
+    monkeypatch.setattr(settings, "jwt_secret_key", "a-strong-random-jwt-key")
+    monkeypatch.setattr(settings, "admin_password", "")
+    with pytest.raises(RuntimeError, match="ADMIN_PASSWORD"):
+        _validate_secrets()
+
+
+def test_validate_secrets_rejects_template_residue_pattern(monkeypatch):
+    """JWT 含模板残留特征（change-in-production / secret-key）也应 fail-fast：
+    历史模板值（如 native-rag-jwt-secret-key-change-in-production）不在精确弱值集合里，
+    但含明显占位特征，属本次补漏的弱值检测。"""
+    from main import _validate_secrets
+    monkeypatch.setattr(settings, "jwt_secret_key", "native-rag-jwt-secret-key-change-in-production")
+    monkeypatch.setattr(settings, "admin_password", "a-strong-admin-pass")
+    with pytest.raises(RuntimeError, match="JWT_SECRET_KEY"):
+        _validate_secrets()
+
+
+def test_validate_secrets_accepts_real_values(monkeypatch):
+    """强随机值通过校验（不应抛）"""
+    from main import _validate_secrets
+    monkeypatch.setattr(settings, "jwt_secret_key", "a-strong-random-jwt-key")
+    monkeypatch.setattr(settings, "admin_password", "a-strong-admin-pass")
+    _validate_secrets()  # 不应抛

@@ -51,3 +51,9 @@ class ValidationError(AppError):
     """业务参数校验失败（400），区别于 FastAPI 参数校验 422"""
     status_code = 400
     code = "VALIDATION_ERROR"
+
+
+class TooManyRequestsError(AppError):
+    """请求过于频繁（429），如登录防爆破锁定"""
+    status_code = 429
+    code = "TOO_MANY_REQUESTS"

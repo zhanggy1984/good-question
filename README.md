@@ -41,7 +41,7 @@
 |------|------|---------|
 | **私有文档知识化** | 上传即自动抽取 → 清洗 → 切片 → 向量化，问答只基于你上传的内容 | 私有文档问不到 |
 | **带溯源问答** | 混合检索（语义 + BGE-M3 稀疏 + Rerank）+ DeepSeek 生成，答案用 `[来源N]` 标注引用 | 答案没出处 |
-| **多用户隔离** | 文档库 + 会话双隔离，归属后端强制校验，普通用户 API 层也拿不到他人数据 | 知识无法隔离 |
+| **多用户隔离** | 文档原文仅 admin 可读（读接口 admin-only），会话按所有者隔离，归属后端强制校验，普通用户 API 层也拿不到他人数据 | 知识无法隔离 |
 | **流式体验** | SSE 逐字返回，思考过程单独折叠展示，首包秒回、不干等 | 等不起 |
 
 > **一句话理解 RAG**：RAG（Retrieval-Augmented Generation，检索增强生成）= 先从你的私有文档里检索出最相关的片段，再让大模型基于这些片段回答。这样大模型就能回答"它的训练数据里根本没有"的私有内容，且答案有出处、可溯源、不凭空编造。
@@ -355,8 +355,10 @@ event: error      LLM 调用失败兜底
 | `ATTU_PORT` | Attu 可视化管理 UI 端口 | `8000` |
 | `MINERU_API_TOKEN` | MinerU 官方 API Token（空 = 本地解析） | 空 |
 | `HF_ENDPOINT` | HuggingFace 下载镜像（国内加速） | `https://hf-mirror.com` |
-| `ADMIN_USERNAME/PASSWORD` | 管理员账号 | `admin` / `change_me_admin` |
-| `JWT_SECRET_KEY` | JWT 签名密钥（生产必须改） | `change-me` |
+| `ADMIN_USERNAME/PASSWORD` | 管理员账号（**须强随机值**；空/占位值启动即失败 fail-fast） | `admin` / 无默认 |
+| `JWT_SECRET_KEY` | JWT 签名密钥（**须强随机值**；空/占位值启动即失败 fail-fast） | 无默认 |
+| `LOGIN_FAIL_MAX` / `LOGIN_FAIL_WINDOW_SECONDS` | 登录防爆破：同一账号连续失败达上限临时锁定 / 窗口秒数（Redis 故障 fail-open + 告警） | `5` / `900` |
+| `CORS_ORIGINS` | CORS 白名单（前端经 nginx 同源反代本不需 CORS，兜底直连开发） | `["http://localhost:8089","http://localhost:5173"]` |
 | `CHAT_RETENTION_DAYS` | 会话保留天数（最后活跃超期物理删除，硬删除不可逆） | `30` |
 | `CHAT_CLEANUP_ENABLED` | 会话过期清理总开关（异常时设 `false` 一键停） | `true` |
 | `CHAT_CLEANUP_INTERVAL_SECONDS` | 定时 sweep 间隔 | `3600` |
@@ -531,7 +533,7 @@ python verify_contract.py                                          # 宿主机�
 
 | 版本 | 日期 | 核心内容 |
 |------|------|----------|
-| **2.3.0** | 2026-08-26 | 统一 API 网关接入：前端 nginx 改反代共享网关 `api-gateway:8099`（Host: gq.local），网关负责 X-Request-ID traceId 根生成（后端日志 `trace_id` 对齐）、按真实 IP 限流（gq_chat 2r/s）、SSE 透传 |
+| **2.4.0** | 2026-08-28 | 上线前安全加固：① 文档读接口限 admin（`list_documents`/`list_document_chunks`/`document_status` 改 `get_admin_user`，普通用户 API 层不再触及文档原文）+ `create_session` 补库存在性校验；② 登录防爆破：Redis 计数连续失败 5 次锁 15 分钟，429 统一错误码，Redis 故障 fail-open + 告警（限流器故障不锁死全员）；③ 安全默认值 fail-fast：JWT/Admin 密钥空或占位值启动即拒绝（不再允许 `change-me`/`admin123` 裸奔）；④ CORS 从 `*` 收紧为白名单；⑤ 安全响应头：`nosniff`/`X-Frame-Options`/`Referrer-Policy`/CSP（后端中间件一处覆盖 8080/8089）；⑥ nginx 补 443 TLS 骨架（证书由共享 infra 入口终止） |
 | **2.2.0** | 2026-08-26 | 会话过期清理：超过保留期（最后活跃 `updated_at`）的会话物理删除，`chat_messages` 外键 CASCADE 级联；双机制——`SessionCleaner` 定时 sweep（asyncio 后台循环 + 分批删除防大事务）+ 查询时惰性清理（详情/聊天即删、列表过滤隐藏）；过期判定统一落 DB 侧 `NOW() - INTERVAL`（Python 不生成 cutoff，防容器/DB 时区错位）；`idx_updated_at` 索引迁移 0004；`CHAT_CLEANUP_ENABLED=false` 一键停 |
 | **2.1.1** | 2026-08-25 | 2.0.4 批次发布落地（打 tag 2.1.1）；前端长答案折叠"收起"失效修复——setup 内 ref 未自动解包，`!showFullAnswer` 恒 false 致 `collapsed` 类永不加，补 `.value` 修复 |
 | **2.0.4** | 2026-08-25 | 问答缓存精准化与对话可靠性加固：缓存 key 纳入 embedding/rerank 模型维度（换模型不串答案）+ 规则化 query 归一化（去客套/emoji/全角，相似问法命中率提升）+ 删除文档/删库即失效缓存；LLM 首轮瞬时错误（429/5xx）自动退避重试 1 次（仅未 yield 事件时整体重试）；章节级检索扩充（同章节兄弟 chunk 合并 context，sources 保持精排 top-3 精确引用）；前端"停止生成"（AbortController）+ 后端断连检测（客户端断开即终止 LLM 调用，不烧 token）；换 embedding 模型维度不匹配启动 fail-fast 报错提示重灌；修复 LLM 首轮返回多 tool_call 时未裁剪导致第二轮 400（assistant 只声明执行的第一个 tool_call，tool 消息与之对齐） |

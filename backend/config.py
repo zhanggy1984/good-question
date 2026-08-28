@@ -21,7 +21,7 @@ class Settings(BaseSettings):
         return f"http://{self.milvus_host}:{self.milvus_port}"
 
     # DeepSeek LLM
-    deepseek_api_key: str = "sk-xxx"
+    deepseek_api_key: str = ""   # 未配置时启动仅告警（聊天不可用），不阻塞服务启动
     deepseek_base_url: str = "https://api.deepseek.com/v1"
     deepseek_model: str = "deepseek-chat"
     # 思考过程开关：deepseek-chat 默认不返回 reasoning_content，须显式开启 thinking
@@ -40,6 +40,11 @@ class Settings(BaseSettings):
     redis_url: str = "redis://redis:6379/2"   # 共享 Redis db index 2（隔离规范）
     chat_cache_enabled: bool = True
     chat_cache_ttl_seconds: int = 7200
+
+    # 登录防爆破（Redis）：同一账号连续失败达 login_fail_max 次即临时锁定，窗口过期自动重置。
+    # 依赖 Redis；Redis 不可用时 fail-open（放行登录）+ 告警，限流器故障不锁死全员。
+    login_fail_max: int = 5
+    login_fail_window_seconds: int = 900
 
     # 会话过期清理：超过保留期（最后活跃时间 updated_at）未更新的会话物理删除。
     # 硬删除不可逆，保留期勿设过小；异常时设 CHAT_CLEANUP_ENABLED=false 可一键停。
@@ -72,12 +77,15 @@ class Settings(BaseSettings):
 
     # Admin
     admin_username: str = "admin"
-    admin_password: str = "admin123"
+    admin_password: str = ""     # 启动时校验：空/占位值 fail-fast（见 main._validate_secrets）
 
     # JWT
-    jwt_secret_key: str = "change-me"
+    jwt_secret_key: str = ""     # 启动时校验：空/占位值 fail-fast（见 main._validate_secrets）
     jwt_algorithm: str = "HS256"
     jwt_expire_minutes: int = 1440
+
+    # CORS 白名单（前端经 nginx 同源反代本不需 CORS，兜底直连开发；禁止 * 通配）
+    cors_origins: list[str] = ["http://localhost:8089", "http://localhost:5173"]
 
     # 文件上传
     upload_dir: str = "./data/uploads"
