@@ -8,10 +8,11 @@ import json
 import sys
 from datetime import datetime
 
-import httpx
 import pytest
 
 sys.path.insert(0, "/app")
+
+from services import llm_service as ls
 
 import services.chat_service as cs
 from langchain_core.messages import AIMessage, HumanMessage
@@ -357,83 +358,6 @@ def test_knowledge_version_filters_by_library(monkeypatch):
     assert cs._knowledge_version(7) == ""
 
 
-def _stream_lines_resp(lines, status_code=200):
-    """把 SSE data 行包装成 _stream_deepseek 需要的 httpx 响应对象
-
-    status_code 可指定非 2xx：_stream_deepseek 现做 resp.raise_for_status()，
-    fake 须提供 status_code 属性（默认 200 兼容既有用例）。
-    """
-    class _Resp:
-        def iter_lines(self):
-            return iter(lines)
-
-        def raise_for_status(self):
-            # 镜像 httpx.Response.raise_for_status：非 2xx 抛 HTTPStatusError（供调用方 except）
-            if self.status_code >= 400:
-                raise httpx.HTTPStatusError(
-                    f"HTTP {self.status_code}", request=None, response=None)
-
-    # class 体内不构成闭包（class 作用域不捕获函数参数），须在类定义后经函数作用域赋值
-    _Resp.status_code = status_code
-    class _Stream:
-        def __enter__(self):
-            return _Resp()
-        def __exit__(self, *a):
-            return False
-    return _Stream()
-
-
-def test_stream_deepseek_parses_usage_and_delta(monkeypatch):
-    """_stream_deepseek：SSE 行解析——content/reasoning 增量 + 流末 usage chunk（不取 delta 报错）"""
-    lines = [
-        'data: {"choices":[{"delta":{"content":"你"}}]}',
-        'data: {"choices":[{"delta":{"reasoning_content":"思考"}}]}',
-        'data: {"choices":[{"delta":{}}],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}',
-        'data: [DONE]',
-    ]
-    monkeypatch.setattr(httpx, "stream", lambda *a, **k: _stream_lines_resp(lines))
-
-    events = list(cs._stream_deepseek([{"role": "user", "content": "问题"}]))
-    assert events[0] == {"type": "content", "content": "你"}
-    assert events[1] == {"type": "reasoning", "content": "思考"}
-    assert events[2]["type"] == "usage"
-    assert events[2]["usage"] == {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
-
-
-def test_stream_deepseek_parses_tool_calls(monkeypatch):
-    """_stream_deepseek：delta.tool_calls 按 index 分片累加，finish_reason=="tool_calls" 触发 flush"""
-    lines = [
-        'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"hybrid_retrieve","arguments":""}}]}}]}',
-        'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\\"query\\":\\""}}]}}]}',
-        'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"工资发放日"}}]},"finish_reason":"tool_calls"}]}',
-        'data: {"choices":[{"delta":{}}],"usage":{"prompt_tokens":3,"completion_tokens":5,"total_tokens":8}}',
-        'data: [DONE]',
-    ]
-    monkeypatch.setattr(httpx, "stream", lambda *a, **k: _stream_lines_resp(lines))
-
-    events = list(cs._stream_deepseek([{"role": "user", "content": "问题"}], tools=[cs.RETRIEVE_TOOL_SCHEMA]))
-    tc = next(e for e in events if e["type"] == "tool_call")
-    call = tc["tool_calls"][0]
-    assert call["id"] == "call_1", "tool_call id 应完整（首个分片携带）"
-    assert call["function"]["name"] == "hybrid_retrieve"
-    assert call["function"]["arguments"] == '{"query":"工资发放日', "arguments 应按分片顺序拼接"
-    usage = next(e for e in events if e["type"] == "usage")
-    assert usage["usage"]["total_tokens"] == 8
-
-
-def test_stream_deepseek_tool_call_flush_on_done(monkeypatch):
-    """_stream_deepseek：个别实现不返回 finish_reason 时，[DONE] 后兜底 flush tool_calls"""
-    lines = [
-        'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","type":"function","function":{"name":"hybrid_retrieve","arguments":"{\\"query\\":\\"a\\"}"}}]}}]}',
-        'data: [DONE]',
-    ]
-    monkeypatch.setattr(httpx, "stream", lambda *a, **k: _stream_lines_resp(lines))
-
-    events = list(cs._stream_deepseek([{"role": "user", "content": "问题"}], tools=[cs.RETRIEVE_TOOL_SCHEMA]))
-    tc = next(e for e in events if e["type"] == "tool_call")
-    assert tc["tool_calls"][0]["function"]["arguments"] == '{"query":"a"}'
-
-
 def test_execute_retrieve_tool_structure(monkeypatch):
     """_execute_retrieve_tool：包装 HybridRetriever，返回 context/sources/source_count/max_score/confidence_band
 
@@ -503,6 +427,19 @@ _TOOL_CALL_EVENT = {"type": "tool_call", "tool_calls": [
      "function": {"name": "hybrid_retrieve", "arguments": '{"query": "工资发放日"}'}}]}
 
 
+def _patch_llm_stream(monkeypatch, fake):
+    """LLM 流式全拦截：首轮 + 多轮两个入口都要 patch
+
+    下沉后流式调用有两个入口：
+    - 首轮：llm_service.stream_round1_with_retry 内部引用 llm_service 模块全局 stream_chat
+    - 多轮：chat_service 的 import 别名 llm_stream_chat
+    只 patch 一个会漏掉另一条路径真连 DeepSeek（测试失败且消耗真实调用）。
+    fake 签名须为 (messages, tools=None)：首轮带 tools（LLM 自主决定），多轮不带。
+    """
+    monkeypatch.setattr(cs, "llm_stream_chat", fake)
+    monkeypatch.setattr(ls, "stream_chat", fake)
+
+
 def _patch_chat_pipeline(monkeypatch, tool_result=None, round1=None, round2=None):
     """stream_chat 外部依赖全隔离：DB/上下文/持久化/检索工具/LLM 流式（按轮次返回事件）
 
@@ -537,7 +474,7 @@ def _patch_chat_pipeline(monkeypatch, tool_result=None, round1=None, round2=None
     monkeypatch.setattr(cs, "_build_context", lambda db, s: ("摘要", []))
     monkeypatch.setattr(cs, "_save_messages", lambda db, s, q, a, src: 1)
     monkeypatch.setattr(cs, "_compress_memory", lambda db, s: None)
-    monkeypatch.setattr(cs, "_stream_deepseek", _fake_stream)
+    _patch_llm_stream(monkeypatch, _fake_stream)
     monkeypatch.setattr(cs, "_execute_retrieve_tool", lambda library_id, query: tool_result)
     monkeypatch.setattr(cs, "_json_log", lambda *a, **k: None)
     # 缓存隔离：默认未命中、不写（避免真实连 Redis）；meta 事件依赖打桩（避免子进程/DB 查询）
@@ -613,7 +550,7 @@ def test_stream_chat_multi_tool_call_trims_to_first(monkeypatch):
         ]}])
 
     _patch_chat_pipeline(monkeypatch, tool_result=_TOOL_RESULT_HIT)
-    monkeypatch.setattr(cs, "_stream_deepseek", _capturing_stream)  # 覆盖 _patch_chat_pipeline 的默认 fake
+    _patch_llm_stream(monkeypatch, _capturing_stream)  # 覆盖 _patch_chat_pipeline 的默认 fake
 
     events = list(cs.stream_chat(1, "多个工具问题"))
     types = [t for t, _ in events]
@@ -652,7 +589,7 @@ def test_stream_chat_retrieve_empty_query_uses_not_found(monkeypatch):
             return iter([_TOOL_CALL_EVENT])
         raise AssertionError("空结果 + 事实查询不应调第二轮 LLM")
 
-    monkeypatch.setattr(cs, "_stream_deepseek", _fake_stream)
+    _patch_llm_stream(monkeypatch, _fake_stream)
     events = list(cs.stream_chat(1, "工资发放日是几号"))
     types = [t for t, _ in events]
     assert types == ["meta", "tool_call", "token", "usage", "done"], f"实际 {types}"
@@ -673,7 +610,7 @@ def test_stream_chat_retrieve_empty_unknown_uses_clarify(monkeypatch):
             return iter([_TOOL_CALL_EVENT])
         raise AssertionError("unknown 空结果不应调第二轮 LLM")
 
-    monkeypatch.setattr(cs, "_stream_deepseek", _fake_stream)
+    _patch_llm_stream(monkeypatch, _fake_stream)
     events = list(cs.stream_chat(1, "Docker"))  # 无闲聊词也无查询标记 → unknown
     tc = next(d for t, d in events if t == "tool_call")
     assert tc["intent"] == "unknown"
@@ -767,7 +704,7 @@ def test_stream_chat_rule_override_empty_query_uses_not_found(monkeypatch):
             return iter([{"type": "content", "content": "工资发放日为每月 10 号。"}])
         raise AssertionError("否决后检索空 + query 不应调第二轮 LLM")
 
-    monkeypatch.setattr(cs, "_stream_deepseek", _fake_stream)
+    _patch_llm_stream(monkeypatch, _fake_stream)
     events = list(cs.stream_chat(1, "工资发放日是几号"))
     types = [t for t, _ in events]
     assert types == ["meta", "token", "tool_call", "token", "usage", "done"], f"实际 {types}"
@@ -791,7 +728,7 @@ def test_stream_chat_rule_override_empty_unknown_uses_clarify(monkeypatch):
             return iter([{"type": "content", "content": "Docker。"}])
         raise AssertionError("否决后检索空 + unknown 不应调第二轮 LLM")
 
-    monkeypatch.setattr(cs, "_stream_deepseek", _fake_stream)
+    _patch_llm_stream(monkeypatch, _fake_stream)
     events = list(cs.stream_chat(1, "Docker"))  # 无闲聊词也无查询标记 → unknown
     toks = [d["content"] for t, d in events if t == "token"]
     assert toks[-1] == cs._UNKNOWN_ANSWER
@@ -1096,7 +1033,7 @@ def test_stream_chat_cache_hit_replays_not_found(monkeypatch):
     def _should_not_query(*a, **k):
         raise AssertionError("缓存命中不应查 Milvus")
 
-    monkeypatch.setattr(cs, "_stream_deepseek", _should_not_call)
+    _patch_llm_stream(monkeypatch, _should_not_call)
     monkeypatch.setattr(cs, "_execute_retrieve_tool", _should_not_query)
     monkeypatch.setattr(cs, "get_cached", lambda library_id, question: cached)
     events = list(cs.stream_chat(1, "工资发放日是几号"))
@@ -1132,13 +1069,6 @@ def test_contracts_manifest_endpoint():
     assert {"greeting", "doc_qa", "no_hit", "summarize"} <= tags
 
 
-def test_stream_deepseek_http_error_raises(monkeypatch):
-    """_stream_deepseek：HTTP 非 2xx（401/429/500）显式抛异常，不再静默空返回（前端可见明确 error）"""
-    monkeypatch.setattr(httpx, "stream", lambda *a, **k: _stream_lines_resp([], status_code=401))
-    with pytest.raises(httpx.HTTPStatusError):
-        list(cs._stream_deepseek([{"role": "user", "content": "问题"}]))
-
-
 def test_stream_chat_first_round_error_yields_error_event(monkeypatch):
     """LLM 第一轮抛异常（网络断/HTTP 错误）：yield error 事件、无 done（异常路径提前 return）"""
     _patch_chat_pipeline(monkeypatch, round1=[{"type": "content", "content": "占位"}])
@@ -1146,7 +1076,7 @@ def test_stream_chat_first_round_error_yields_error_event(monkeypatch):
     def _boom(messages, tools=None):
         raise RuntimeError("LLM 调用失败")
 
-    monkeypatch.setattr(cs, "_stream_deepseek", _boom)
+    _patch_llm_stream(monkeypatch, _boom)
     events = list(cs.stream_chat(1, "工资发放日是几号"))
     types = [t for t, _ in events]
     assert "error" in types, f"第一轮失败应产出 error 事件，实际 {types}"
@@ -1213,87 +1143,6 @@ def test_stream_chat_cache_write_uses_normalized_query(monkeypatch):
     monkeypatch.setattr(cs, "set_cached", lambda library_id, question, payload: written.append((library_id, question)))
     list(cs.stream_chat(1, "请问一下工资发放日是几号，谢谢"))
     assert written == [(7, "工资发放日是几号")], f"写入 key 应归一化（去前缀/后缀/尾标点），实际 {written}"
-
-
-def test_stream_round1_retry_transient(monkeypatch):
-    """首轮瞬时错误（429）且未 yield 任何事件：整体退避重试一次，成功后续流"""
-    from types import SimpleNamespace
-    calls = {"n": 0}
-
-    def _boom_then_ok(messages, tools=None):
-        calls["n"] += 1
-        if calls["n"] == 1:
-            raise httpx.HTTPStatusError(
-                "429 限流", request=object(), response=SimpleNamespace(status_code=429)
-            )
-        yield {"type": "content", "content": "OK"}
-        yield {"type": "usage", "usage": {"total_tokens": 1}}
-
-    monkeypatch.setattr(cs.settings, "chat_llm_max_attempts", 2)
-    monkeypatch.setattr(cs.settings, "chat_llm_retry_backoff_seconds", 0)
-    monkeypatch.setattr(cs, "_stream_deepseek", _boom_then_ok)
-    events = list(cs._stream_round1_with_retry([{"role": "user", "content": "问题"}]))
-    assert calls["n"] == 2, "总调用次数上限 2 = 首次失败后重试一次"
-    assert [e["type"] for e in events] == ["content", "usage"]
-
-
-def test_stream_round1_no_retry_on_401(monkeypatch):
-    """客户端错误（401）非瞬时：不可重试（重试无意义且可能计费），立即抛给上层"""
-    from types import SimpleNamespace
-    calls = {"n": 0}
-
-    def _boom_401(messages, tools=None):
-        calls["n"] += 1
-        raise httpx.HTTPStatusError(
-            "401 未授权", request=object(), response=SimpleNamespace(status_code=401)
-        )
-
-    monkeypatch.setattr(cs.settings, "chat_llm_max_attempts", 2)
-    monkeypatch.setattr(cs, "_stream_deepseek", _boom_401)
-    with pytest.raises(httpx.HTTPStatusError):
-        list(cs._stream_round1_with_retry([{"role": "user", "content": "问题"}]))
-    assert calls["n"] == 1, "401 非瞬时错误不应重试"
-
-
-def test_stream_round1_no_retry_after_yield(monkeypatch):
-    """已 yield 事件后出错不可整体重试：重试会事件序错乱/重复，即使 5xx 也直接抛"""
-    from types import SimpleNamespace
-    calls = {"n": 0}
-
-    def _yield_then_boom(messages, tools=None):
-        calls["n"] += 1
-        yield {"type": "content", "content": "部分内容"}
-        raise httpx.HTTPStatusError(
-            "500 服务端错误", request=object(), response=SimpleNamespace(status_code=500)
-        )
-
-    monkeypatch.setattr(cs.settings, "chat_llm_max_attempts", 2)
-    monkeypatch.setattr(cs, "_stream_deepseek", _yield_then_boom)
-    got = []
-    with pytest.raises(httpx.HTTPStatusError):
-        for ev in cs._stream_round1_with_retry([{"role": "user", "content": "问题"}]):
-            got.append(ev)
-    assert calls["n"] == 1, "已 yield 事件后即使 5xx 也不重试"
-    assert [e["type"] for e in got] == ["content"]
-
-
-def test_stream_round1_max_attempts_follows_config(monkeypatch):
-    """总调用次数 = 配置 chat_llm_max_attempts（含首次）：配置 5、持续 429 时恰好调用 5 次"""
-    from types import SimpleNamespace
-    calls = {"n": 0}
-
-    def _always_429(messages, tools=None):
-        calls["n"] += 1
-        raise httpx.HTTPStatusError(
-            "429 限流", request=object(), response=SimpleNamespace(status_code=429)
-        )
-
-    monkeypatch.setattr(cs.settings, "chat_llm_max_attempts", 5)
-    monkeypatch.setattr(cs.settings, "chat_llm_retry_backoff_seconds", 0)
-    monkeypatch.setattr(cs, "_stream_deepseek", _always_429)
-    with pytest.raises(httpx.HTTPStatusError):
-        list(cs._stream_round1_with_retry([{"role": "user", "content": "问题"}]))
-    assert calls["n"] == 5, "总调用次数应等于配置值（含首次）"
 
 
 def test_execute_retrieve_tool_sources_from_top_hits(monkeypatch):

@@ -6,7 +6,7 @@
 
 - **做什么**：把私有文档变成可问答的知识库。上传的每份文档都被自动切成片段并向量化，你只需像聊天一样提问，模型**只基于你的文档作答，答必带引用出处**。
 - **怎么做**：**LLM 自主决定是否检索**（function calling 编排）→ 命中检索则**混合检索 + 重排 + 置信分级** → 大模型带来源流式作答；规则护栏在"该查不查"和"查不到就编"两个口子上兜底。
-- **好在哪**：答必有据、不编造、多用户隔离、首包秒回；对外是契约对齐的 SSE 事件流，有 208 项单元测试 + 运行时契约验证脚本，开箱即验。
+- **好在哪**：答必有据、不编造、多用户隔离、首包秒回；对外是契约对齐的 SSE 事件流，有 212 项单元测试 + 运行时契约验证脚本，开箱即验。
 
 ## 目录
 
@@ -394,7 +394,7 @@ good-question/
 │   ├── middleware/           # JWT 鉴权 Depends
 │   ├── utils/                # mineru_extractor / mineru_api / text_cleaner / chunker / security / exceptions
 │   ├── alembic/              # 数据库迁移（versions/：0001~0004）
-│   ├── tests/                # 单元测试（208 个测试函数，pytest 已内置镜像）
+│   ├── tests/                # 单元测试（212 个测试函数，pytest 已内置镜像）
 │   ├── requirements.txt      # 生产依赖
 │   └── requirements-dev.txt  # 测试依赖（pytest，已装进镜像）
 ├── frontend/                 # Vue 3 + Naive UI 前端
@@ -426,7 +426,7 @@ good-question/
 
 | 层 | 内容 | 说明 |
 |----|------|------|
-| 单元测试 | `backend/tests/` 208 个测试函数 | 安全 / 清洗 / 切片（含跨页全局 section、@@PAGE 页码、章节 section_id）/ 文档服务（含 reprocess 双层防并发、删除失效缓存）/ embedding / 检索（含章节扩充、extra_filters 库隔离）/ 聊天服务（含五维度防注入、两级置信档边界、闲聊粗判、未命中固定话术、F3 规则否决权与豁免分支、LLM 空返回兜底、HTTP 错误显式化、缓存 key 规则化归一、首轮瞬时错误重试）/ 会话清理（DB 侧 NOW() 判定、分批 sweep、惰性三落点）/ chat_cache（key 隔离、模型维度、版本失效、熔断降级、SSE 重放事件序）/ llama_store（node↔hit、embedding 维度 fail-fast）/ api（断连检测）/ 安全加固（文档读接口限 admin 越权回归、登录限流 429 集成、seed_admin 密码轮换、安全响应头与 CORS 白名单收紧、fail-fast 弱值拒绝启动），纯函数级，不依赖外部服务 |
+| 单元测试 | `backend/tests/` 212 个测试函数 | 安全 / 清洗 / 切片（含跨页全局 section、@@PAGE 页码、章节 section_id）/ 文档服务（含 reprocess 双层防并发、删除失效缓存）/ embedding / 检索（含章节扩充、extra_filters 库隔离）/ 聊天服务（含五维度防注入、两级置信档边界、闲聊粗判、未命中固定话术、F3 规则否决权与豁免分支、LLM 空返回兜底、HTTP 错误显式化、缓存 key 规则化归一、首轮瞬时错误重试）/ 会话清理（DB 侧 NOW() 判定、分批 sweep、惰性三落点）/ chat_cache（key 隔离、模型维度、版本失效、熔断降级、SSE 重放事件序）/ llama_store（node↔hit、embedding 维度 fail-fast）/ api（断连检测）/ 安全加固（文档读接口限 admin 越权回归、登录限流 429 集成、seed_admin 密码轮换、安全响应头与 CORS 白名单收紧、fail-fast 弱值拒绝启动），纯函数级，不依赖外部服务 |
 | 契约验证 | `verify_contract.py` | 运行时读真实 SSE 事件流，断言事件序（meta 首、usage 在 done 前）与字段完整（meta/tool_call/usage/reasoning/token/ts）；`tool_call.status` 支持 ok/error（LLM 决策）与 rule_override/rule_override_error（三期规则否决） |
 | 迁移验证 | `test-data/e2e.py` / `chat.py` / `verify_old_data.py` | 登录→建库→上传→就绪 / chat 完整链路读 SSE / 旧数据重灌后检索验证 |
 | 前端构建 | `npm run build` | 改了前端代码必须先 build，否则 nginx 里是旧页面 |
