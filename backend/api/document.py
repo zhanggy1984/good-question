@@ -26,9 +26,9 @@ def list_documents(
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=100),
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    admin: User = Depends(get_admin_user),
 ):
-    """文档列表（登录用户可见，admin 可管理）"""
+    """文档列表（仅 admin；普通用户问答只经检索，看不到原文列表）"""
     library_service.get_library(db, library_id)  # 校验库存在
     total = db.query(func.count(Document.id)).filter(Document.library_id == library_id).scalar() or 0
     items = (
@@ -94,9 +94,9 @@ def list_document_chunks(
     page: int = Query(1, ge=1),
     page_size: int = Query(10, ge=1, le=100),
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    admin: User = Depends(get_admin_user),
 ):
-    """文档的 chunk 分页列表（登录用户可看）"""
+    """文档的 chunk 分页列表（仅 admin；chunk 原文内容不对普通用户开放）"""
     doc = db.query(Document).filter(Document.id == document_id).first()
     if doc is None:
         raise NotFoundError("文档不存在")
@@ -116,9 +116,9 @@ def list_document_chunks(
 def document_status(
     document_id: int,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    admin: User = Depends(get_admin_user),
 ):
-    """查询文档处理状态（前端轮询）"""
+    """查询文档处理状态（仅 admin）"""
     doc = db.query(Document).filter(Document.id == document_id).first()
     if doc is None:
         raise NotFoundError("文档不存在")

@@ -11,7 +11,7 @@ from sqlalchemy.orm import Session
 
 from config import settings
 from database import SessionLocal
-from models import ChatMessage, ChatSession
+from models import ChatMessage, ChatSession, DocumentLibrary
 from schemas.common import Page
 from services.chat_cleanup import (
     delete_session_by_id,
@@ -263,6 +263,9 @@ def _is_smalltalk(text: str, history: list | None = None) -> bool:
 
 def create_session(db: Session, user_id: int, library_id: int) -> ChatSession:
     """创建会话（绑定文档库）"""
+    # 库存在性校验（共享读语义，不做归属校验）：防会话指向不存在的库（脏数据 + 检索空转）
+    if db.query(DocumentLibrary).filter(DocumentLibrary.id == library_id).first() is None:
+        raise NotFoundError("文档库不存在")
     session = ChatSession(user_id=user_id, library_id=library_id)
     db.add(session)
     db.commit()

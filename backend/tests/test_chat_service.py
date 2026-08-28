@@ -23,6 +23,7 @@ from services.chat_service import (
     _is_low_confidence,
     _is_smalltalk,
 )
+from utils.exceptions import NotFoundError
 
 
 def test_build_messages_fc_system():
@@ -1315,3 +1316,35 @@ def test_execute_retrieve_tool_sources_from_top_hits(monkeypatch):
     assert r["source_count"] == 3, "source_count 应取扩充后 context 量（与 [来源N] 编号一致）"
     assert len(r["sources"]) == 2, "sources 应精确指向精排 top-3 小节，不随扩充稀释"
     assert [s["chunk_index"] for s in r["sources"]] == [0, 1]
+
+
+# ════════ P0 附带校验：create_session 库存在性 ════════
+
+
+def test_create_session_missing_library_raises_not_found():
+    """库不存在时 create_session 应抛 NotFoundError（防会话指向不存在的库，脏数据 + 检索空转）"""
+    class _Q:
+        def filter(self, *a, **k):
+            return self
+
+        def first(self):
+            return None
+
+    class _Db:
+        def query(self, model):
+            return _Q()
+
+        def add(self, x):
+            pass
+
+        def commit(self):
+            pass
+
+        def refresh(self, x):
+            pass
+
+        def close(self):
+            pass
+
+    with pytest.raises(NotFoundError):
+        cs.create_session(_Db(), user_id=1, library_id=999)
