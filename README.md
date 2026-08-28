@@ -412,7 +412,13 @@ good-question/
 └── data/                     # 上传文件存储（uploads/）
 ```
 
-**后端代码分层**：`api/`（路由，薄）→ `services/`（业务逻辑）→ `models/` + `utils/`（数据与基础设施）。新增功能一般改 `api/` + `services/` 即可。
+**后端代码分层**（按"业务语义"切四层，依赖单向——上层可依赖下层，下层绝不依赖上层）：
+- **交互层** `api/` + `schemas/`：路由、鉴权、请求解析、响应格式化（薄）；
+- **控制层** `services/chat_service.py`：意图理解、会话状态、任务编排、SSE 事件流组装；
+- **能力层** `services/{document,library,auth,dashboard,retrieval}_service.py`：有业务语义的具体操作（文档生命周期、知识库管理、检索编排）；
+- **资源层** `services/{llm,embedding,rerank,vector_store,llama_store,chat_cache,...}` + `models/` + `utils/`：无业务语义的基础设施（LLM/向量库/缓存/ORM/工具）。
+
+依赖规则：资源层不得依赖上层，能力层不得依赖控制层，任何层不得依赖 `api/`。新增功能一般改 `api/` + 对应 service；新增服务须归层并保持依赖方向（`tests/test_architecture.py` 自动守护）。
 
 ---
 
