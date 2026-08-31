@@ -230,7 +230,7 @@ open http://localhost                  # admin 登录 → 聊天页选"示例知
 
 幂等可重跑：重复执行会删除已存在的示例库并重建（会话/文档/向量级联清理），结果一致。
 
-> ⚠️ 示例/验证脚本默认以 `admin / admin123` 登录（`config.py` 默认值）；若已修改 `ADMIN_PASSWORD`，请用环境变量 `RAG_ADMIN_USER` / `RAG_ADMIN_PASS` 覆盖后运行。
+> ⚠️ 示例/验证脚本默认以 `admin / 123456` 登录（`.env` `ADMIN_PASSWORD`）；若已修改 `ADMIN_PASSWORD`，请用环境变量 `RAG_ADMIN_USER` / `RAG_ADMIN_PASS` 覆盖后运行。
 
 ### 4.3 6 个示例场景
 

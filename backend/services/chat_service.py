@@ -62,7 +62,7 @@ SYSTEM_PROMPT = """<role>
 </constraints>
 
 <output>
-简洁中文直接给结论；引用用 [来源N]；常规问答控制在 200 字以内，总结/列举类可适当展开但不超过 600 字，避免冗余客套；不确定或无法回答时如实说明，绝不编造。
+简洁中文直接给结论；引用用 [来源N]；常规问答控制在 200 字以内；流程/步骤/规则/条款类问题必须完整展开（按列举类处理，展开至 400-600 字），逐项覆盖检索结果中的全部关键步骤与约束细节，包括触发条件（何种情形下生效/回滚）、时间窗口（具体时限）、责任主体（由谁执行）、结果要求（交付什么、是否需要复盘记录），异常与回滚等关键细节不得省略；协议/条款类问题除字面问点外，还须覆盖 context 中同章节出现的相邻约束条款（如违约责任、赔偿、解除情形），不得因问题只问部分而漏答相关条款；不得因追求简短而遗漏要点；总结类可适当展开但不超过 600 字，避免冗余客套；不确定或无法回答时如实说明，绝不编造。
 </output>
 
 对话历史摘要（早期对话已压缩，供参考）：
@@ -641,7 +641,8 @@ def stream_chat(session_id: int, user_content: str):
             try:
                 args = json.loads(tool_calls[0]["function"]["arguments"] or "{}")
                 query = clean_query(args.get("query"), user_content)
-                result = execute_retrieve_tool(session.library_id, query)
+                # 传原始用户问题：总结/列举类扩召回（3162 类 query 已丢意图词，需 user_content 兜底）
+                result = execute_retrieve_tool(session.library_id, query, user_content)
                 status = "ok"
             except Exception as e:
                 logger.warning("[chat] 检索工具执行失败: %s", e)

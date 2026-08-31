@@ -17,15 +17,20 @@ from services.retrieval_types import RetrievedChunk
 logger = logging.getLogger("native_rag")
 
 
-@lru_cache(maxsize=1)
-def _get_reranker():
-    """懒加载 LlamaIndex BGE-Reranker 后置处理器（首次从 HF 镜像下载模型）"""
+@lru_cache(maxsize=2)
+def _get_reranker(top_n: int = 3):
+    """懒加载 LlamaIndex BGE-Reranker 后置处理器（首次从 HF 镜像下载模型）
+
+    top_n 参数化（默认 3，总结/列举类扩召回传 6）：SentenceTransformerRerank 在
+    postprocess_nodes 内部按 self.top_n 截断，rerank_chunks 的 top_k 只在截断后切片，
+    想扩召回必须同步放大 top_n。lru_cache 按 top_n 分键（并发安全，不复用实例改属性）。
+    """
     from llama_index.core.postprocessor import SentenceTransformerRerank
 
-    logger.info("[rerank] 加载模型 %s", settings.rerank_model_name)
+    logger.info("[rerank] 加载模型 %s (top_n=%s)", settings.rerank_model_name, top_n)
     return SentenceTransformerRerank(
         model=settings.rerank_model_name,
-        top_n=3,  # 参数名 top_n（旧独立集成包为 top_k）；postprocess_nodes 内部按 top_n 截断
+        top_n=top_n,
         device="cpu",
     )
 
@@ -62,7 +67,7 @@ def rerank_chunks(
     if not chunks:
         return [], None
     try:
-        reranker = _get_reranker()
+        reranker = _get_reranker(top_k)
         nodes = _chunks_to_nodes(chunks)
         ranked = reranker.postprocess_nodes(nodes, query_str=query)
         # 内部已按 node.score 降序，此处再排序幂等兜底；score 为 CrossEncoder 原始分

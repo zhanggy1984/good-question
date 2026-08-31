@@ -5,9 +5,9 @@ sys.stdout.reconfigure(encoding="utf-8", errors="replace")  # 统一 UTF-8，避
 
 BASE = "http://localhost"
 
-# 登录凭据从环境变量读取（本地开发默认 admin/admin123），避免脚本内硬编码
+# 登录凭据从环境变量读取（本地开发默认 admin/123456），避免脚本内硬编码
 USER = os.environ.get("RAG_ADMIN_USER", "admin")
-PASS = os.environ.get("RAG_ADMIN_PASS", "admin123")
+PASS = os.environ.get("RAG_ADMIN_PASS", "123456")
 
 def req(method, path, auth=None, data=None, timeout=120):
     headers = {}

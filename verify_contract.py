@@ -21,7 +21,25 @@ import httpx
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 BASE = "http://127.0.0.1:8080"
-ADMIN = ("admin", "admin123")
+
+# 凭证从 .env 读取（勿硬编码，避免与真实账号脱钩过时）；缺省回退旧 admin/admin123
+def _load_admin() -> tuple[str, str]:
+    import os
+    try:
+        with open(os.path.join(os.path.dirname(__file__), ".env"), encoding="utf-8") as f:
+            env = {}
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    k, _, v = line.partition("=")
+                    env[k.strip()] = v.strip().strip('"').strip("'")
+        return (env.get("ADMIN_USERNAME") or "admin",
+                env.get("ADMIN_PASSWORD") or "admin123")
+    except FileNotFoundError:
+        return "admin", "admin123"
+
+
+ADMIN = _load_admin()
 
 
 def p(msg: str) -> None:
