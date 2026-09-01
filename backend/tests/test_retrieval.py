@@ -180,9 +180,10 @@ def test_expand_section_context_merges_siblings():
         retriever = HybridRetriever(library_id=1)
         merged = retriever._expand_section_context("查询", top)
     assert [c.content for c in merged] == ["A", "B", "sib1", "sib3"], "top 在前，兄弟 chunk 按命中顺序追加"
-    # 回查按 document_id+section_id 精确过滤，limit 用章节上限
+    # 回查按 document_id 过滤（str：Milvus 标量字段存字符串，传 int 生成不了匹配表达式），
+    # limit 用章节上限；相邻节扩展在应用层完成（命中节 ±ADJACENT 并入），不在查询层过滤 section
     _, kwargs = hs.call_args
-    assert kwargs["extra_filters"] == {"document_id": 1, "section_id": "1:0"}
+    assert kwargs["extra_filters"] == {"document_id": "1"}
     assert kwargs["limit"] == 20
 
 
@@ -251,8 +252,12 @@ def test_execute_retrieve_tool_structure(monkeypatch):
     assert "测试.md" in r["context"] and "内容内容内容" in r["context"]
 
 
-def test_execute_retrieve_tool_sources_from_top_hits(monkeypatch):
-    """章节扩充后：sources 取精排 top-3（top_hits）保引用精度，source_count 取扩充后 context 量"""
+def test_execute_retrieve_tool_sources_all_chunks_with_expanded_flag(monkeypatch):
+    """章节扩充后：sources 携带全部 context chunk（含扩充），expanded 标记区分精排/扩充。
+
+    编号与 context 的 [来源N] 一一对应（引用可全量核对）；精排 top-3 expanded=False，
+    扩充 chunk expanded=True（前端降权标"补充上下文"）。
+    """
     from types import SimpleNamespace
     top1 = SimpleNamespace(content="A", metadata={"document_name": "a.md", "chunk_index": 0})
     top2 = SimpleNamespace(content="B", metadata={"document_name": "a.md", "chunk_index": 1})
@@ -269,8 +274,9 @@ def test_execute_retrieve_tool_sources_from_top_hits(monkeypatch):
     monkeypatch.setattr(rs, "HybridRetriever", _Retriever)
     r = rs.execute_retrieve_tool(7, "问题")
     assert r["source_count"] == 3, "source_count 应取扩充后 context 量（与 [来源N] 编号一致）"
-    assert len(r["sources"]) == 2, "sources 应精确指向精排 top-3 小节，不随扩充稀释"
-    assert [s["chunk_index"] for s in r["sources"]] == [0, 1]
+    assert len(r["sources"]) == 3, "sources 应携带全部 context chunk（含扩充），编号一一对应"
+    assert [s["chunk_index"] for s in r["sources"]] == [0, 1, 2]
+    assert [s["expanded"] for s in r["sources"]] == [False, False, True], "精排 False、扩充 True"
 
 
 def test_confidence_band_three_band():

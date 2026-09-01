@@ -12,7 +12,12 @@
         ⚠️ 检索服务暂不可用，以下回答未经文档验证，可信度偏低
       </div>
       <div class="bubble">
-        <div v-if="message.content" class="answer" :class="{ collapsed: answerCollapsed }">{{ message.content }}</div>
+        <div v-if="message.content" class="answer" :class="{ collapsed: answerCollapsed }">
+          <template v-for="(seg, i) in parsedContent" :key="i">
+            <span v-if="seg.ref" class="src-ref">{{ seg.text }}</span>
+            <template v-else>{{ seg.text }}</template>
+          </template>
+        </div>
         <span v-else-if="message.streaming && !message.sources?.length" class="retrieving">
           🔍 检索中…
         </span>
@@ -28,7 +33,7 @@
           📎 引用来源（{{ message.sources.length }}）{{ showSources ? '收起' : '展开' }}
         </button>
         <div v-if="showSources">
-          <SourceCard v-for="(s, i) in message.sources" :key="i" :source="s" />
+          <SourceCard v-for="(s, i) in message.sources" :key="i" :source="s" :index="i" :expanded="s.expanded" />
         </div>
       </div>
     </div>
@@ -50,6 +55,23 @@ const answerCollapsible = computed(
   () => props.message.role === 'assistant' && props.message.content.length > 500 && !props.message.streaming,
 )
 const answerCollapsed = computed(() => answerCollapsible.value && !showFullAnswer.value)
+// 回答中 [来源N] 引用高亮：纯视觉强调（可对应卡片角标编号），不建立跳转。
+// 流式生成中 content 增量变化，computed 实时重算；半截未闭合的 "[来源" 不匹配正则，
+// 按普通文本展示，不会出现残留高亮
+const parsedContent = computed<{ text: string; ref: boolean }[]>(() => {
+  const content = props.message.content
+  const parts: { text: string; ref: boolean }[] = []
+  const re = /\[来源\d+\]/g
+  let last = 0
+  let m: RegExpExecArray | null
+  while ((m = re.exec(content))) {
+    if (m.index > last) parts.push({ text: content.slice(last, m.index), ref: false })
+    parts.push({ text: m[0], ref: true })
+    last = m.index + m[0].length
+  }
+  if (last < content.length) parts.push({ text: content.slice(last), ref: false })
+  return parts.length ? parts : [{ text: content, ref: false }]
+})
 </script>
 
 <style scoped>
@@ -108,6 +130,13 @@ const answerCollapsed = computed(() => answerCollapsible.value && !showFullAnswe
 .answer.collapsed {
   max-height: 240px;
   overflow-y: auto;
+}
+.src-ref {
+  color: var(--primary-color, #63e2b7);
+  font-weight: 600;
+  background: rgba(99, 226, 183, 0.12);
+  border-radius: 3px;
+  padding: 0 2px;
 }
 .answer-toggle {
   display: block;

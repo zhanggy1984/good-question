@@ -1,6 +1,8 @@
 <template>
-  <div class="source-card">
+  <div class="source-card" :class="{ expanded }">
     <div class="source-header">
+      <span v-if="index !== undefined" class="source-index">[来源{{ index + 1 }}]</span>
+      <span v-if="expanded" class="expanded-tag">⤵ 补充上下文</span>
       <span class="doc-icon">📄</span>
       <span class="doc-name">{{ source.document_name }}</span>
       <span v-if="source.chunk_index !== undefined && source.chunk_index !== null" class="chunk-info">
@@ -18,7 +20,12 @@
 import { computed } from 'vue'
 import type { Source } from '@/api/session'
 
-const props = defineProps<{ source: Source }>()
+const props = defineProps<{ source: Source; index?: number; expanded?: boolean }>()
+
+// 编号角标：与回答中 [来源N] 高亮同源（后端 _format_docs 编号，sources 即全部 context chunk），
+// 用户可把回答引用与来源卡片一一对应；不传 index 时（无编号场景）不显示角标。
+// expanded：相邻节扩充的补充上下文，降权展示（弱化卡片 + "补充上下文"标签），
+// 精排命中不设（undefined 即未扩充，不影响旧版数据渲染）
 
 // 页码：新版 page_range（单页 N / 跨页 A-B）；旧版消息回退到单值 page_number
 const pageLabel = computed(() => {
@@ -47,6 +54,22 @@ const pageLabel = computed(() => {
 .doc-name {
   font-weight: 600;
   font-size: 12px;
+}
+.source-index {
+  color: var(--primary-color, #63e2b7);
+  font-weight: 600;
+  font-size: 12px;
+  flex-shrink: 0;
+}
+.expanded-tag {
+  color: rgba(255, 255, 255, 0.45);
+  font-size: 11px;
+  flex-shrink: 0;
+}
+.source-card.expanded {
+  opacity: 0.8;
+  border-left-color: rgba(255, 255, 255, 0.28);
+  background: rgba(255, 255, 255, 0.015);
 }
 .chunk-info {
   opacity: 0.6;

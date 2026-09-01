@@ -230,8 +230,14 @@ def execute_retrieve_tool(library_id: int, query: str, user_question: str | None
     )
     chunks = retriever.invoke(query)  # 章节扩充后的 context（含同节兄弟 chunk）
     max_score = retriever.max_rerank_score
-    # sources 保持精排 top-3 精确小节：章节扩充只扩大喂 LLM 的 context，不稀释引用精度
+    # sources 携带全部 context chunk（含章节扩充），编号与 context 的 [来源N] 一一对应，
+    # 任意引用都可核对（此前只带精排 top-3，LLM 引用扩充节时无对应卡片）。
+    # 精排 top-3 由 expanded 标记区分：False=精排命中（精确小节），True=相邻节扩充
+    # （前端降权标"补充上下文"）。invoke 返回 merged = list(top)+扩充，顺序与编号一致。
     top_hits = retriever.top_hits or chunks
+    precise_keys = {
+        (c.metadata.get("document_id"), c.metadata.get("chunk_index")) for c in top_hits
+    }
     sources = [
         {
             "document_name": c.metadata.get("document_name", "未知文档"),
@@ -240,8 +246,11 @@ def execute_retrieve_tool(library_id: int, query: str, user_question: str | None
             "chunk_index": c.metadata.get("chunk_index"),
             "total_chunks": c.metadata.get("total_chunks"),
             "page_range": c.metadata.get("page_range") or [0, 0],
+            "expanded": (
+                (c.metadata.get("document_id"), c.metadata.get("chunk_index")) not in precise_keys
+            ),
         }
-        for c in top_hits
+        for c in chunks
     ]
     return {
         "context": _format_docs(chunks),
