@@ -392,7 +392,7 @@ def _patch_chat_pipeline(monkeypatch, tool_result=None, round1=None, round2=None
     monkeypatch.setattr(cs, "_save_messages", lambda db, s, q, a, src: 1)
     monkeypatch.setattr(cs, "_compress_memory", lambda db, s: None)
     _patch_llm_stream(monkeypatch, _fake_stream)
-    monkeypatch.setattr(cs, "execute_retrieve_tool", lambda library_id, query: tool_result)
+    monkeypatch.setattr(cs, "execute_retrieve_tool", lambda library_id, query, user_question=None: tool_result)
     monkeypatch.setattr(cs, "_json_log", lambda *a, **k: None)
     # 缓存隔离：默认未命中、不写（避免真实连 Redis）；meta 事件依赖打桩（避免子进程/DB 查询）
     monkeypatch.setattr(cs, "get_cached", lambda library_id, question: None)
@@ -773,7 +773,7 @@ def test_stream_chat_rule_override_error(monkeypatch):
         ],
     )
 
-    def _boom(library_id, query):
+    def _boom(*a, **k):
         raise RuntimeError("milvus down")
 
     monkeypatch.setattr(cs, "execute_retrieve_tool", _boom)
@@ -796,7 +796,7 @@ def test_stream_chat_retrieve_error_llm_fallback(monkeypatch):
         ],
     )
 
-    def _boom(library_id, query):
+    def _boom(*a, **k):
         raise RuntimeError("milvus down")
 
     monkeypatch.setattr(cs, "execute_retrieve_tool", _boom)
@@ -889,7 +889,7 @@ def test_stream_chat_retrieve_error_not_cached(monkeypatch):
         ],
     )
 
-    def _boom(library_id, query):
+    def _boom(*a, **k):
         raise RuntimeError("milvus down")
 
     monkeypatch.setattr(cs, "execute_retrieve_tool", _boom)
@@ -978,7 +978,7 @@ def test_contracts_manifest_endpoint():
     assert r.status_code == 200
     data = r.json()
     assert data["agent"] == "good-question"
-    assert data["contract_version"] == "1.0"
+    assert data["contract_version"] == "2.0"
     chat_iface = next(i for i in data["interfaces"] if i["name"] == "chat")
     assert chat_iface["contract_type"] == "sse"
     assert chat_iface["llm"] is True
