@@ -184,6 +184,10 @@ async function send(content: string) {
     }
     const res = await apiCreateSession(selectedLibrary.value)
     sid = res.data.id
+    // 先设当前会话：send 下方已 push 消息，若后触发路由 watch→openSession→setMessages([]) 会清空
+    // 刚 push 的消息（无会话首轮实时渲染空白，实测需刷新才恢复）。setCurrent 后 watch 因
+    // sid===currentSessionId 跳过 openSession，SSE 事件才能正常 append 到流式消息上。
+    chat.setCurrent(sid)
     router.replace(`/chat/${sid}`)
     await loadSessions()
   }
