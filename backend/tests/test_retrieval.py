@@ -236,10 +236,10 @@ def test_execute_retrieve_tool_structure(monkeypatch):
 
     class _Retriever:
         max_rerank_score = np.float32(0.9)  # 模拟 rerank 返回的 numpy 标量
-        top_hits = []  # 章节扩充前未设置时退化为 invoke 结果（与 HybridRetriever.__init__ 契约一致）
+        top_hits = []  # 同源模式不再读取 top_hits（历史字段保留）
         def __init__(self, *a, **k):
             pass
-        def invoke(self, q):
+        def invoke(self, q, expand=True):
             return [chunk]
 
     monkeypatch.setattr(rs, "HybridRetriever", _Retriever)
@@ -252,31 +252,32 @@ def test_execute_retrieve_tool_structure(monkeypatch):
     assert "测试.md" in r["context"] and "内容内容内容" in r["context"]
 
 
-def test_execute_retrieve_tool_sources_all_chunks_with_expanded_flag(monkeypatch):
-    """章节扩充后：sources 携带全部 context chunk（含扩充），expanded 标记区分精排/扩充。
+def test_execute_retrieve_tool_sources_align_with_context(monkeypatch):
+    """关闭章节扩充后：context 与 sources 同源（rerank 精排），编号一一对应、引用必有卡片。
 
-    编号与 context 的 [来源N] 一一对应（引用可全量核对）；精排 top-3 expanded=False，
-    扩充 chunk expanded=True（前端降权标"补充上下文"）。
+    execute_retrieve_tool 以 expand=False 调 invoke，context 与 sources 都来自精排结果，
+    source_count == len(sources) == context 编号数（普通 3 / 总结类 6），回答 [来源N] 必有卡片。
     """
     from types import SimpleNamespace
     top1 = SimpleNamespace(content="A", metadata={"document_name": "a.md", "chunk_index": 0})
     top2 = SimpleNamespace(content="B", metadata={"document_name": "a.md", "chunk_index": 1})
-    expanded = [top1, top2, SimpleNamespace(content="C", metadata={"document_name": "a.md", "chunk_index": 2})]
+    top3 = SimpleNamespace(content="C", metadata={"document_name": "a.md", "chunk_index": 2})
 
     class _Retriever:
         def __init__(self, *a, **k):
             self.max_rerank_score = 0.8
-            self.top_hits = [top1, top2]
+            self.top_hits = []  # 同源模式不再读取 top_hits（历史字段保留）
 
-        def invoke(self, q):
-            return expanded
+        def invoke(self, q, expand=True):
+            return [top1, top2, top3]
 
     monkeypatch.setattr(rs, "HybridRetriever", _Retriever)
     r = rs.execute_retrieve_tool(7, "问题")
-    assert r["source_count"] == 3, "source_count 应取扩充后 context 量（与 [来源N] 编号一致）"
-    assert len(r["sources"]) == 3, "sources 应携带全部 context chunk（含扩充），编号一一对应"
+    assert r["source_count"] == 3, "source_count == 来源数（普通问答精排 top-3）"
+    assert len(r["sources"]) == 3, "sources 与 context 同源（无扩充分流）"
     assert [s["chunk_index"] for s in r["sources"]] == [0, 1, 2]
-    assert [s["expanded"] for s in r["sources"]] == [False, False, True], "精排 False、扩充 True"
+    assert "expanded" not in r["sources"][0], "扩充区分标记已废弃，sources 无 expanded 字段"
+    assert r["context"].count("[来源") == 3, "context 编号数与卡片一一对应"
 
 
 def test_confidence_band_three_band():

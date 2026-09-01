@@ -20,8 +20,6 @@ export interface Source {
   page_range?: number[]
   page_number?: number // 旧版消息兼容（sources_json 历史数据）
   heading_level?: number
-  /** 章节扩充标记：true=相邻节补充上下文（前端降权展示"补充上下文"），false=精排命中 */
-  expanded?: boolean
 }
 
 export interface ChatMessage {

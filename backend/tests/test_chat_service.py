@@ -1032,7 +1032,7 @@ def test_stream_chat_empty_answer_fallback_smalltalk(monkeypatch):
     assert tok["content"] == cs._EMPTY_ANSWER_FALLBACK
 
 
-# ════════ #3 缓存 key 规则化归一 / #4 首轮瞬时错误重试 / #5 sources 精确取 top_hits ════════
+# ════════ #3 缓存 key 规则化归一 / #4 首轮瞬时错误重试（sources 随 tool 结果同源透传，无独立裁剪逻辑） ════════
 
 
 def test_stream_chat_cache_lookup_uses_normalized_query(monkeypatch):

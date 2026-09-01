@@ -33,7 +33,7 @@
           📎 引用来源（{{ message.sources.length }}）{{ showSources ? '收起' : '展开' }}
         </button>
         <div v-if="showSources">
-          <SourceCard v-for="(s, i) in message.sources" :key="i" :source="s" :index="i" :expanded="s.expanded" />
+          <SourceCard v-for="(s, i) in message.sources" :key="i" :source="s" :index="i" />
         </div>
       </div>
     </div>
@@ -47,7 +47,8 @@ import type { Message } from '@/stores/chat'
 
 const props = defineProps<{ message: Message }>()
 const showReasoning = ref(false)
-const showSources = ref(true)
+// 引用来源默认折叠：来源卡片是辅助信息，展开问答区不被挤占；需要核对时手动展开
+const showSources = ref(false)
 // 长答案折叠：仅 assistant 且流式结束且内容超阈值时可折叠（流式生成中始终展开，
 // 保证输出过程可见 + 自动滚动正常）；折叠态限高可滚动，内容不丢失
 const showFullAnswer = ref(false)

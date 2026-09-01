@@ -49,9 +49,11 @@ class HybridRetriever:
         self.candidate_k = candidate_k  # 单路召回候选数（语义+稀疏各 3，控制 rerank 候选总量）
         self.top_k = top_k  # rerank 精排进 context 的数量（总结/列举类调高，覆盖多 section）
         self.max_rerank_score: float | None = None  # 本次检索 rerank 精排最高分（invoke 后读取）
-        self.top_hits: list[RetrievedChunk] = []  # rerank top-3（章节扩充前的精确小节，sources 用）
+        self.top_hits: list[RetrievedChunk] = []  # rerank 精排结果（历史字段：同源模式下 execute_retrieve_tool 直接读 invoke 返回值）
 
-    def invoke(self, query: str) -> list[RetrievedChunk]:
+    def invoke(self, query: str, expand: bool = True) -> list[RetrievedChunk]:
+        # expand=False 关闭章节扩充：execute_retrieve_tool 默认关闭（context 与 sources 同源、
+        # 编号一一对应，回答引用必有卡片）。扩充逻辑保留，需相邻约束条款时按需开启。
         # 0. 直接用原 query 检索，不再 LLM 改写：
         #    改写需每次检索前多一次 LLM 调用（2-4s），是 sources 事件前的主要延迟；
         #    且历史实测改写检索结果与原 query 几乎一致（双路 vs 单路结论），收益趋零。
@@ -90,7 +92,7 @@ class HybridRetriever:
         #    仅同节回查取不到 → 命中节前后各 _SECTION_EXPAND_ADJACENT 节一并并入。sources
         #    仍精确指向 top-3 小节。旧数据无 section_id 时天然退化（不扩充）；扩充失败降级
         #    保留 top-3，不阻塞主链路。
-        if not result:
+        if not result or not expand:
             return result
         return self._expand_section_context(search_query, result)
 
@@ -221,6 +223,11 @@ def execute_retrieve_tool(library_id: int, query: str, user_question: str | None
 
     user_question 传入原始用户问题：总结/列举类问题扩召回（candidate_k/top_k 3→6），
     普通问答行为不变（沿用默认 top-3）。
+
+    context 与 sources 同源（rerank 精排结果，不做章节扩充）：普通问答 top-3、
+    总结类 top-6，[来源N] 编号与卡片一一对应，回答引用必有出处。关闭章节扩充
+    避免弱相关的相邻节进入 context 导致回答发散、引用无卡片（实测体验断裂）。
+    扩充逻辑保留在 HybridRetriever.invoke(expand=True)，需相邻约束条款时按需开启。
     """
     summary = _is_summary_intent(user_question, query)
     retriever = HybridRetriever(
@@ -228,16 +235,9 @@ def execute_retrieve_tool(library_id: int, query: str, user_question: str | None
         candidate_k=6 if summary else 3,
         top_k=6 if summary else 3,
     )
-    chunks = retriever.invoke(query)  # 章节扩充后的 context（含同节兄弟 chunk）
+    chunks = retriever.invoke(query, expand=False)  # 精排结果：普通 top-3 / 总结类 top-6
     max_score = retriever.max_rerank_score
-    # sources 携带全部 context chunk（含章节扩充），编号与 context 的 [来源N] 一一对应，
-    # 任意引用都可核对（此前只带精排 top-3，LLM 引用扩充节时无对应卡片）。
-    # 精排 top-3 由 expanded 标记区分：False=精排命中（精确小节），True=相邻节扩充
-    # （前端降权标"补充上下文"）。invoke 返回 merged = list(top)+扩充，顺序与编号一致。
-    top_hits = retriever.top_hits or chunks
-    precise_keys = {
-        (c.metadata.get("document_id"), c.metadata.get("chunk_index")) for c in top_hits
-    }
+    # context 与 sources 同源：sources 按 chunks 编号构建，回答 [来源N] 引用必有卡片。
     sources = [
         {
             "document_name": c.metadata.get("document_name", "未知文档"),
@@ -246,16 +246,15 @@ def execute_retrieve_tool(library_id: int, query: str, user_question: str | None
             "chunk_index": c.metadata.get("chunk_index"),
             "total_chunks": c.metadata.get("total_chunks"),
             "page_range": c.metadata.get("page_range") or [0, 0],
-            "expanded": (
-                (c.metadata.get("document_id"), c.metadata.get("chunk_index")) not in precise_keys
-            ),
         }
         for c in chunks
     ]
     return {
         "context": _format_docs(chunks),
         "sources": sources,
-        "source_count": len(chunks),  # 与 context 的 [来源N] 编号一致（LLM 视角的上下文量）
+        # 命中信号 + 来源数：与卡片数一致（普通 3 / 总结类 6）。source_count>0 是
+        # chat_service/chat_cache 判断"检索命中"与缓存重放 sources 的开关。
+        "source_count": len(chunks),
         # rerank 返回 numpy float32，进 SSE tool_call result 与 JSON 日志须转原生 float（json.dumps 不认 float32）
         "max_score": float(max_score) if max_score is not None else None,
         "confidence_band": _confidence_band(max_score),
