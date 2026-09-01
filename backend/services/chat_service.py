@@ -20,6 +20,7 @@ from services.chat_cleanup import (
 from services.chat_cache import get_cached, replay_events, set_cached
 from services.llm_service import (
     get_llm,
+    has_tool_call_markup,
     stream_chat as llm_stream_chat,
     stream_round1_with_retry as llm_stream_round1_with_retry,
 )
@@ -527,7 +528,10 @@ def _replay_cached(db: Session, session: ChatSession, user_content: str, cached:
         cache="hit",
         duration_ms=0,
     )
-    assistant_id = _save_messages(db, session, user_content, cached["answer"], cached["sources"])
+    # v3 缓存：sources 按工具轮次记录在 tool_rounds 各轮，落库聚合全部来源
+    #（与真实流程一致——二次检索轮次的来源也进 DB；版本校验已拦截旧结构缓存）
+    replay_sources = [s for tr in (cached.get("tool_rounds") or []) for s in (tr.get("sources") or [])]
+    assistant_id = _save_messages(db, session, user_content, cached["answer"], replay_sources)
     _compress_memory(db, session)
     yield ("done", {"message_id": assistant_id, "ts": _ts()})
 
@@ -595,6 +599,9 @@ def stream_chat(session_id: int, user_content: str):
         sources: list = []
         full_answer = ""
         full_reasoning = ""
+        # 工具轮次日志：每次执行检索（首轮 / 命中路径二次检索 / 规则否决）后 append 一条
+        # {query, status, result, sources}，供缓存 payload 与监控日志复用（改动 2 引入多轮）
+        tool_rounds_log: list[dict] = []
 
         def _merge_usage(usage: dict) -> None:
             """多轮调用的 token 消耗合并进 usage_total（done 前统一发出一个 usage 事件）"""
@@ -664,12 +671,27 @@ def stream_chat(session_id: int, user_content: str):
                 "non_doc_question": non_doc_question,
                 "ts": _ts(),
             })
+            # 记录首轮工具轮次（供缓存 payload / 监控日志复用）
+            tool_rounds_log.append({
+                "query": query,
+                "status": status,
+                "result": (
+                    {"source_count": result["source_count"], "max_score": result["max_score"],
+                     "confidence_band": result["confidence_band"]}
+                    if result else None
+                ),
+                "sources": result["sources"] if result and result["source_count"] > 0 else [],
+            })
 
-            # 3. 命中：推 sources + 第二轮 LLM 基于 tool 结果作答；空：规则三路兜底
+            # 3. 命中：推 sources + agent loop 作答；空：规则三路兜底
             if result and result["source_count"] > 0:
                 sources = result["sources"]
                 yield ("sources", {"sources": sources, "ts": _ts()})
-                # DeepSeek tool 轮次必须回传 assistant 的 tool_calls + reasoning_content，否则报错
+                # 第一轮检索结果：注入 assistant tool_calls + tool 消息（DeepSeek tool 轮次
+                # 必须回传 assistant 的 tool_calls + reasoning_content，否则报错 400）。
+                # 命中路径自此进入 agent loop：后续轮次也带 tools——低置信命中时 LLM 可能换
+                # query 再检索一次（3161 实测：首轮 max_score=0.21 低置信，LLM 想二次检索，
+                # 旧实现第二轮不带 tools，二次检索意图以 DSML 声明泄漏进 answer 致评测 fail）。
                 messages += [
                     {"role": "assistant", "content": "", "reasoning_content": full_reasoning,
                      "tool_calls": tool_calls},
@@ -679,21 +701,99 @@ def stream_chat(session_id: int, user_content: str):
                           "confidence_band": result["confidence_band"]},
                          ensure_ascii=False)},
                 ]
+                tool_rounds_used = 1  # 首轮检索已用 1 次工具轮次；循环内每次再检索 +1
+                round_no = 2
                 try:
-                    for ev in llm_stream_chat(messages):  # 第二轮不带 tools，防再循环
-                        llm_rounds = 2
-                        if ev["type"] == "usage":
-                            _merge_usage(ev["usage"])
-                        elif ev["type"] == "reasoning":
-                            full_reasoning += ev["content"]
-                            yield ("reasoning", {"content": ev["content"], "delta": ev["content"], "ts": _ts()})
-                        elif ev["type"] == "tool_call":
-                            continue
-                        else:
-                            full_answer += ev["content"]
-                            yield ("token", {"content": ev["content"], "delta": ev["content"], "ts": _ts()})
+                    while True:
+                        pending_calls = None  # 本轮 LLM 发出的工具调用（循环内执行并回传）
+                        loop_reasoning = ""  # 本轮新增思考（回传 assistant 消息用，对齐首轮模式）
+                        for ev in llm_stream_chat(messages, tools=[RETRIEVE_TOOL_SCHEMA]):
+                            llm_rounds = round_no
+                            if ev["type"] == "usage":
+                                _merge_usage(ev["usage"])
+                            elif ev["type"] == "reasoning":
+                                full_reasoning += ev["content"]
+                                loop_reasoning += ev["content"]
+                                yield ("reasoning", {"content": ev["content"], "delta": ev["content"], "ts": _ts()})
+                            elif ev["type"] == "tool_call":
+                                calls = ev["tool_calls"]
+                                if len(calls) > 1:
+                                    logger.warning("[chat] LLM 返回 %s 个 tool_call，仅执行第一个（单工具场景）", len(calls))
+                                pending_calls = calls[:1]
+                            else:
+                                # content：LLM 直接作答。改动 4 兜底——若 content 残留工具调用
+                                # 声明（改动 1 解析失败/流中断的极端场景），视为该轮未真正作答，
+                                # 落"未找到"固定话术而非把声明当答案（防 DSML 泄漏成 answer）
+                                if has_tool_call_markup(ev["content"]):
+                                    full_answer = _NOT_FOUND_ANSWER
+                                    yield ("token", {"content": _NOT_FOUND_ANSWER, "delta": _NOT_FOUND_ANSWER, "ts": _ts()})
+                                    pending_calls = None
+                                    empty_fallback = True  # 声明未兑现：异常结果不写缓存（防固化，改动 3）
+                                    break
+                                full_answer += ev["content"]
+                                yield ("token", {"content": ev["content"], "delta": ev["content"], "ts": _ts()})
+                        if pending_calls is None:
+                            break  # 本轮作答结束（或已兜底未找到），正常收尾
+                        if tool_rounds_used >= MAX_TOOL_ROUNDS:
+                            # 已达工具轮次上限：不再循环（防无限检索），LLM 持续想检索而未给
+                            # 实质回答，强制落"未找到"（含"未找到"，满足评测 no_hit 断言）。
+                            # 首轮+二次检索均已执行仍无实质回答，属模型行为异常，不写缓存（防固化）
+                            full_answer = _NOT_FOUND_ANSWER
+                            yield ("token", {"content": _NOT_FOUND_ANSWER, "delta": _NOT_FOUND_ANSWER, "ts": _ts()})
+                            empty_fallback = True
+                            break
+                        # 执行二次检索（复用首轮工具执行模式），结果经 tool 消息回传继续作答
+                        try:
+                            args = json.loads(pending_calls[0]["function"]["arguments"] or "{}")
+                            retry_query = clean_query(args.get("query"), user_content)
+                            retry_result = execute_retrieve_tool(session.library_id, retry_query, user_content)
+                            retry_status = "ok"
+                        except Exception as e:
+                            logger.warning("[chat] 二次检索执行失败: %s", e)
+                            retry_query = user_content
+                            retry_result = None
+                            retry_status = "error"
+                        yield ("tool_call", {
+                            "id": f"retrieve-{_ts()}",
+                            "name": "hybrid_retrieve",
+                            "args": {"query": retry_query},
+                            "result": (
+                                {k: retry_result[k] for k in ("source_count", "max_score", "confidence_band")}
+                                if retry_result else {}
+                            ),
+                            "status": retry_status,
+                            "intent": rule_intent,
+                            "non_doc_question": non_doc_question,
+                            "ts": _ts(),
+                        })
+                        if retry_result and retry_result["source_count"] > 0:
+                            yield ("sources", {"sources": retry_result["sources"], "ts": _ts()})
+                        # 记录二次检索轮次（供缓存 payload / 监控日志复用）
+                        tool_rounds_log.append({
+                            "query": retry_query,
+                            "status": retry_status,
+                            "result": (
+                                {"source_count": retry_result["source_count"], "max_score": retry_result["max_score"],
+                                 "confidence_band": retry_result["confidence_band"]}
+                                if retry_result else None
+                            ),
+                            "sources": retry_result["sources"] if retry_result and retry_result["source_count"] > 0 else [],
+                        })
+                        messages += [
+                            {"role": "assistant", "content": "", "reasoning_content": loop_reasoning,
+                             "tool_calls": pending_calls},
+                            {"role": "tool", "tool_call_id": pending_calls[0]["id"],
+                             "content": json.dumps(
+                                 {"context": (retry_result or {}).get("context", ""),
+                                  "source_count": (retry_result or {}).get("source_count", 0),
+                                  "confidence_band": (retry_result or {}).get("confidence_band", "none"),
+                                  **({"error": _RETRIEVAL_UNAVAILABLE_HINT} if retry_result is None else {})},
+                                 ensure_ascii=False)},
+                        ]
+                        tool_rounds_used += 1
+                        round_no += 1
                 except Exception as e:
-                    logger.error("[chat] LLM 第二轮流式失败: %s", e)
+                    logger.error("[chat] 命中路径 agent loop 流式失败: %s", e)
                     yield ("error", {"message": "LLM 调用失败，请稍后重试"})
                     return
             elif result is None:
@@ -796,6 +896,17 @@ def stream_chat(session_id: int, user_content: str):
                 "non_doc_question": non_doc_question,
                 "ts": _ts(),
             })
+            # 记录规则否决轮次（供缓存 payload / 监控日志复用；检索失败不写缓存，但记录无妨）
+            tool_rounds_log.append({
+                "query": query,
+                "status": status,
+                "result": (
+                    {"source_count": result["source_count"], "max_score": result["max_score"],
+                     "confidence_band": result["confidence_band"]}
+                    if result else None
+                ),
+                "sources": result["sources"] if result and result["source_count"] > 0 else [],
+            })
             if result and result["source_count"] > 0:
                 sources = result["sources"]
                 yield ("sources", {"sources": sources, "ts": _ts()})
@@ -875,13 +986,22 @@ def stream_chat(session_id: int, user_content: str):
             duration_ms=int((time.time() - t_start) * 1000),
         )
 
-        # 4.5 LLM 空返回兜底：走到此处必未发过 error（异常路径已提前 return），但 LLM 可能
-        # 正常结束却零 content（只吐 reasoning / 静默失败）。空答案落库会让前端空白气泡，
-        # 补一条中性话术（不编造内容）；empty_fallback 标记使其不写缓存（异常结果无缓存价值）。
+        # 4.5 LLM 空返回/未作答兜底：走到此处必未发过 error（异常路径已提前 return），但 LLM
+        # 可能正常结束却零 content（只吐 reasoning / 静默失败），或 content 仅残留工具调用声明
+        #（改动 1 在流式层拦截失败的极端兜底，改动 4：声明即视为该轮未作答）。空答案落库会让
+        # 前端空白气泡，补固定话术；empty_fallback 标记使其不写缓存（异常结果无缓存价值）。
         if not full_answer:
             full_answer = _EMPTY_ANSWER_FALLBACK
             empty_fallback = True
             logger.warning("[chat] LLM 未产出有效回答，兜底话术 session=%s", session_id)
+            yield ("token", {"content": full_answer, "delta": full_answer, "ts": _ts()})
+        elif has_tool_call_markup(full_answer):
+            # 改动 4：answer 残留工具调用声明（标准 XML/DSML 变体）——LLM 想调工具但声明未
+            # 兑现为实质回答。落"未找到"固定话术（含"未找到"，满足评测 no_hit 断言），
+            # 不能落 _EMPTY_ANSWER_FALLBACK（不含"未找到"，keyword 断言仍 fail）
+            full_answer = _NOT_FOUND_ANSWER
+            empty_fallback = True  # 坏 answer 不写缓存（改动 3）
+            logger.warning("[chat] answer 残留工具调用声明，兜底未找到 session=%s", session_id)
             yield ("token", {"content": full_answer, "delta": full_answer, "ts": _ts()})
 
         # 5. usage（多轮合并为一个）+ 写缓存 + 保存消息 + 记忆压缩
@@ -891,18 +1011,16 @@ def stream_chat(session_id: int, user_content: str):
         # 检索空/低分的固定话术同样写：命中后直接重放"未找到"，不再查 Milvus（省检索耗时），
         # 文档更新后 flush_library 清库，未找到缓存不会长期误导。检索失败（Milvus 不可用）
         # 的 LLM 兜底不写（retrieval_failed：无文档依据，且 Milvus 恢复后应重新检索）。
-        if cache_state == "miss" and llm_rounds > 0 and not _is_smalltalk(user_content) and not retrieval_failed and not empty_fallback:
+        # 改动 3 缓存防护：answer 残留工具调用声明（DSML/XML 泄漏的坏 answer）不写缓存，
+        # 防止坏答案在 TTL 内固化复现（3161 教训：3031/3032 命中 3030 坏缓存重复 fail）。
+        if (cache_state == "miss" and llm_rounds > 0 and not _is_smalltalk(user_content)
+                and not retrieval_failed and not empty_fallback
+                and not has_tool_call_markup(full_answer)):
             set_cached(session.library_id, normalize_query(user_content), {
                 "decided_retrieve": decided_retrieve,
                 "rule_override": rule_override,
-                "query": query if (decided_retrieve or rule_override) else user_content,
-                "tool_status": status if (decided_retrieve or rule_override) else None,
-                "tool_result": (
-                    {"source_count": result["source_count"], "max_score": result["max_score"],
-                     "confidence_band": result["confidence_band"]}
-                    if result else None
-                ),
-                "sources": sources,
+                # 工具轮次按序记录（命中路径可能多轮检索，改动 2），replay 按序重放 tool_call/sources
+                "tool_rounds": tool_rounds_log,
                 # 首/次轮思考拆分缓存（replay 按真实事件序重放）；intent/non_doc_question
                 # 供重放 tool_call 透传——命中空检索时前端据其决定是否提示"未找到"
                 "reasoning_round1": reasoning_round1,

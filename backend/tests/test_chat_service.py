@@ -384,8 +384,15 @@ def _patch_chat_pipeline(monkeypatch, tool_result=None, round1=None, round2=None
         def first(self):
             return (False,)
 
+    _calls = {"n": 0}
+
     def _fake_stream(messages, tools=None):
-        return iter(round1 if tools else (round2 if round2 is not None else round1))
+        # 按调用次数区分轮次：命中路径第二轮起也带 tools（改动 2 agent loop），
+        # 不能再按 tools 判轮次；首轮必返回 round1，后续轮次返回 round2
+        _calls["n"] += 1
+        if _calls["n"] == 1:
+            return iter(round1)
+        return iter(round2 if round2 is not None else round1)
 
     monkeypatch.setattr(cs, "SessionLocal", lambda: _FakeDb())
     monkeypatch.setattr(cs, "_build_context", lambda db, s: ("摘要", []))
@@ -450,9 +457,12 @@ def test_stream_chat_multi_tool_call_trims_to_first(monkeypatch):
     否则 tool 消息仅回执一个 id 与 assistant.tool_calls 数量不匹配，DeepSeek 第二轮返回 400（实测复现）。"""
     round2_messages: dict = {}
 
+    _calls = {"n": 0}
+
     def _capturing_stream(messages, tools=None):
-        if tools is None:
-            # 第二轮：捕获消息供断言，返回正常 token 事件
+        _calls["n"] += 1
+        if _calls["n"] >= 2:
+            # 命中路径第二轮起（改动 2 也带 tools）：捕获消息供断言，返回正常 token 事件
             round2_messages["msgs"] = messages
             return iter([
                 {"type": "content", "content": "仅按第一个工具结果作答。"},
@@ -816,11 +826,14 @@ def test_stream_chat_cache_hit_replay(monkeypatch):
     cached = {
         "decided_retrieve": True,
         "rule_override": False,
-        "query": "工资发放日",
-        "tool_status": "ok",
-        "tool_result": {"source_count": 1, "max_score": 0.9, "confidence_band": "high"},
-        "sources": [{"document_name": "测试.md", "heading_path": ["标题"], "chunk_content": "内容",
-                     "chunk_index": 1, "total_chunks": 3}],
+        # v3：工具轮次列表（首轮命中记录 query/result/sources）
+        "tool_rounds": [{
+            "query": "工资发放日",
+            "status": "ok",
+            "result": {"source_count": 1, "max_score": 0.9, "confidence_band": "high"},
+            "sources": [{"document_name": "测试.md", "heading_path": ["标题"], "chunk_content": "内容",
+                         "chunk_index": 1, "total_chunks": 3}],
+        }],
         "reasoning_round1": "思考过程",
         "reasoning_round2": "",
         "intent": "query",
@@ -872,9 +885,10 @@ def test_stream_chat_retrieve_hit_writes_cache(monkeypatch):
     assert lib == 7 and question == "工资发放日是几号"
     assert payload["answer"] == "工资发放日为每月 10 号。"
     assert payload["decided_retrieve"] is True
-    assert payload["tool_result"]["source_count"] == 1
+    # v3：工具轮次列表（首轮命中记录 query/result/sources）
+    assert payload["tool_rounds"][0]["result"]["source_count"] == 1
+    assert "工资发放日" in payload["tool_rounds"][0]["query"]
     assert payload["usage"]["total_tokens"] == 7
-    assert "工资发放日" in payload["query"]
 
 
 def test_stream_chat_retrieve_error_not_cached(monkeypatch):
@@ -923,7 +937,7 @@ def test_stream_chat_retrieve_empty_writes_cache(monkeypatch):
     list(cs.stream_chat(1, "工资发放日是几号"))
     assert len(written) == 1
     assert written[0]["answer"] == cs._NOT_FOUND_ANSWER
-    assert written[0]["tool_result"]["source_count"] == 0
+    assert written[0]["tool_rounds"][0]["result"]["source_count"] == 0
 
 
 def test_stream_chat_cache_hit_replays_not_found(monkeypatch):
@@ -931,10 +945,12 @@ def test_stream_chat_cache_hit_replays_not_found(monkeypatch):
     cached = {
         "decided_retrieve": True,
         "rule_override": False,
-        "query": "工资发放日",
-        "tool_status": "ok",
-        "tool_result": {"source_count": 0, "max_score": None, "confidence_band": "none"},
-        "sources": [],
+        "tool_rounds": [{
+            "query": "工资发放日",
+            "status": "ok",
+            "result": {"source_count": 0, "max_score": None, "confidence_band": "none"},
+            "sources": [],
+        }],
         "reasoning_round1": "",
         "reasoning_round2": "",
         "intent": "query",
@@ -1092,3 +1108,144 @@ def test_create_session_missing_library_raises_not_found():
 
     with pytest.raises(NotFoundError):
         cs.create_session(_Db(), user_id=1, library_id=999)
+
+
+# ════════ 3161 修复：命中路径二次检索 agent loop（改动 2）+ 缓存防护（改动 3）+ 兜底落未找到（改动 4）════════
+# 根因：DeepSeek V4 把二次检索意图渲染成 DSML 工具调用声明泄漏进 answer（旧实现命中路径第二轮
+# 不带 tools，LLM 无法真正二次检索）；改动 2 让命中路径后续轮次带 tools 走 agent loop，改动 3/4
+# 兜底"声明泄漏"与"达轮次上限"两种残余场景。以下 fake 按调用次数区分轮次（命中路径第二轮起
+# 也带 tools，不能再按 tools 判轮次）。
+
+_DSML_MARKUP = (
+    "<｜｜DSML｜｜tool_calls>"
+    "<｜｜DSML｜｜invoke name=\"hybrid_retrieve\">"
+    "<｜｜DSML｜｜parameter name=\"query\">发薪日</｜｜DSML｜｜parameter>"
+    "</｜｜DSML｜｜invoke></｜｜DSML｜｜tool_calls>"
+)
+
+
+def test_stream_chat_hit_second_round_retrieves_then_answers(monkeypatch):
+    """改动2：命中路径第二轮 LLM 再发 tool_call（低置信想换 query 二次检索，3161 场景）→ 执行二次检索 → 第三轮作答"""
+    _patch_chat_pipeline(monkeypatch, tool_result=_TOOL_RESULT_HIT)
+    calls = {"n": 0}
+
+    def _fake(messages, tools=None):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return iter([_TOOL_CALL_EVENT])
+        if calls["n"] == 2:
+            # 第二轮：低置信想再检，query 换词（旧实现第二轮不带 tools → 此意图泄漏成 DSML 声明）
+            return iter([{"type": "tool_call", "tool_calls": [
+                {"id": "call_2", "type": "function",
+                 "function": {"name": "hybrid_retrieve", "arguments": '{"query": "发薪日 工资结算"}'}}]}])
+        # 第三轮：基于二次检索结果作答
+        return iter([{"type": "content", "content": "根据文档，未找到工资发放日的具体规定，建议确认文档范围。"},
+                     {"type": "usage", "usage": {"prompt_tokens": 5, "completion_tokens": 2, "total_tokens": 7}}])
+
+    _patch_llm_stream(monkeypatch, _fake)
+    events = list(cs.stream_chat(1, "工资发放日是几号"))
+    types = [t for t, _ in events]
+    assert calls["n"] == 3, f"首轮+二次检索轮+作答轮共 3 次调用，实际 {calls['n']}"
+    assert types.count("tool_call") == 2, f"首轮+二次检索各一次，实际 {types}"
+    assert types.count("sources") == 2, f"两轮检索各发一次 sources，实际 {types}"
+    tcs = [d for t, d in events if t == "tool_call"]
+    assert "发薪日" in tcs[1]["args"]["query"], f"二次检索应换 query，实际 {tcs[1]['args']['query']}"
+    assert tcs[1]["status"] == "ok"
+    toks = [d["content"] for t, d in events if t == "token"]
+    assert "未找到工资发放日" in "".join(toks)
+    assert types[-2] == "usage" and types[-1] == "done"
+
+
+def test_stream_chat_hit_tool_loop_max_rounds_not_found(monkeypatch):
+    """改动2：命中路径每轮都发 tool_call（持续想检索未作答）→ 达 MAX_TOOL_ROUNDS 上限强制落"未找到"（防无限检索）"""
+    _patch_chat_pipeline(monkeypatch, tool_result=_TOOL_RESULT_HIT)
+    calls = {"n": 0}
+
+    def _always_retrieve(messages, tools=None):
+        calls["n"] += 1
+        return iter([{"type": "tool_call", "tool_calls": [
+            {"id": f"call_{calls['n']}", "type": "function",
+             "function": {"name": "hybrid_retrieve", "arguments": '{"query": "再查"}'}}]}])
+
+    _patch_llm_stream(monkeypatch, _always_retrieve)
+    events = list(cs.stream_chat(1, "工资发放日是几号"))
+    types = [t for t, _ in events]
+    assert calls["n"] == 3, f"首轮+1 次二次检索+达上限落话术前轮，共 3 次调用，实际 {calls['n']}"
+    assert types.count("tool_call") == 2, f"应恰有首轮+1 次二次检索（第 3 轮不再执行工具），实际 {types}"
+    assert types.count("sources") == 2
+    toks = [d["content"] for t, d in events if t == "token"]
+    assert toks[-1] == cs._NOT_FOUND_ANSWER, f"达轮次上限应强制落未找到，实际 {toks[-1]!r}"
+    assert types[-2] == "usage" and types[-1] == "done"
+
+
+def test_stream_chat_hit_second_round_residual_markup_not_found(monkeypatch):
+    """改动4（命中路径内联兜底）+改动3：第二轮 content 残留工具调用声明（改动1 拦截失败的极端场景）
+    → 落"未找到"且声明不泄漏成 token，坏 answer 不写缓存"""
+    written = []
+    _patch_chat_pipeline(monkeypatch, tool_result=_TOOL_RESULT_HIT)
+    calls = {"n": 0}
+
+    def _fake(messages, tools=None):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return iter([_TOOL_CALL_EVENT])
+        return iter([{"type": "content", "content": _DSML_MARKUP}])  # 残留 DSML 声明
+
+    _patch_llm_stream(monkeypatch, _fake)
+    monkeypatch.setattr(cs, "set_cached", lambda *a, **k: written.append(a))
+    events = list(cs.stream_chat(1, "工资发放日是几号"))
+    types = [t for t, _ in events]
+    toks = [d["content"] for t, d in events if t == "token"]
+    assert toks == [cs._NOT_FOUND_ANSWER], f"残留声明应兜底未找到且不泄漏，实际 {toks!r}"
+    assert all("DSML" not in t and "<" not in t for t in toks), "声明不得泄漏进 token"
+    assert written == [], "残留声明的坏 answer 不写缓存（改动 3，防缓存固化复现）"
+    assert types[-2] == "usage" and types[-1] == "done"
+
+
+def test_stream_chat_override_residual_markup_fallback_not_found(monkeypatch):
+    """改动4（收尾兜底）：非命中路径（F3 否决强制检索）content 残留声明 → 收尾 elif 落"未找到"，不写缓存"""
+    written = []
+    _patch_chat_pipeline(
+        monkeypatch,
+        tool_result=_TOOL_RESULT_HIT,
+        round1=[{"type": "content", "content": "工资发放日为每月 10 号。"},
+                {"type": "usage", "usage": {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5}}],
+        round2=[
+            {"type": "content", "content": _DSML_MARKUP},  # 第二轮残留声明（改动1 未拦截的极端兜底）
+            {"type": "usage", "usage": {"prompt_tokens": 4, "completion_tokens": 3, "total_tokens": 7}},
+        ],
+    )
+    monkeypatch.setattr(cs, "set_cached", lambda *a, **k: written.append(a))
+    events = list(cs.stream_chat(1, "工资发放日是几号"))  # query 意图 → F3 否决强制检索命中 → 第二轮残留声明
+    toks = [d["content"] for t, d in events if t == "token"]
+    assert toks[-1] == cs._NOT_FOUND_ANSWER, f"残留声明应兜底未找到（落库语义），实际 {toks[-1]!r}"
+    assert written == [], "残留声明的坏 answer 不写缓存（改动 3）"
+
+
+def test_stream_chat_hit_multi_round_writes_cache(monkeypatch):
+    """改动2：命中路径二次检索后写缓存——tool_rounds 按序记录两轮（query/result/sources），replay 可还原"""
+    written = []
+    _patch_chat_pipeline(monkeypatch, tool_result=_TOOL_RESULT_HIT)
+    calls = {"n": 0}
+
+    def _fake(messages, tools=None):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return iter([_TOOL_CALL_EVENT])
+        if calls["n"] == 2:
+            return iter([{"type": "tool_call", "tool_calls": [
+                {"id": "call_2", "type": "function",
+                 "function": {"name": "hybrid_retrieve", "arguments": '{"query": "发薪日"}'}}]}])
+        return iter([{"type": "content", "content": "根据文档，未找到工资发放日的具体规定。"},
+                     {"type": "usage", "usage": {"prompt_tokens": 5, "completion_tokens": 2, "total_tokens": 7}}])
+
+    _patch_llm_stream(monkeypatch, _fake)
+    monkeypatch.setattr(cs, "set_cached", lambda library_id, question, payload: written.append(payload))
+    list(cs.stream_chat(1, "工资发放日是几号"))
+    assert len(written) == 1
+    trs = written[0]["tool_rounds"]
+    assert len(trs) == 2, f"二次检索后应记录 2 条工具轮次，实际 {len(trs)}"
+    assert trs[0]["result"]["source_count"] == 1
+    assert trs[1]["result"]["source_count"] == 1
+    assert "发薪日" in trs[1]["query"], f"第二轮应记录二次检索 query，实际 {trs[1]['query']}"
+    assert written[0]["answer"] == "根据文档，未找到工资发放日的具体规定。"

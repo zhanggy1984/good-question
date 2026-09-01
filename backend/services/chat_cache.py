@@ -31,7 +31,9 @@ except ImportError:  # 宿主无 redis 依赖时降级为无缓存（容器内 D
     _redis_lib = None
 
 # 缓存结构版本：重放/落库逻辑演进时 +1，旧缓存自然过期不兼容
-_CACHE_VERSION = 2
+# 3（2026-09-01）：命中路径引入 agent loop（改动 2），工具轮次从单轮 tool_result/sources
+# 升级为 tool_rounds 列表（多轮检索按序重放）。bump 后部署自动作废含 3030 坏条目的全部旧缓存
+_CACHE_VERSION = 3
 
 # 连接失败熔断：Redis 不可用时静默降级，_DISABLE_COOLDOWN_SECONDS 内不再尝试
 # 连接（避免每次请求都白等 socket timeout，也避免反复打错误日志）
@@ -166,26 +168,28 @@ def replay_events(value: dict) -> Iterator[tuple[str, dict]]:
 
     decided = value["decided_retrieve"]
     override = value["rule_override"]
-    tr = value["tool_result"]
+    tool_rounds = value.get("tool_rounds") or []  # v3：工具轮次按序记录（命中路径可多轮）
     for ch in value.get("reasoning_round1") or []:
         yield ("reasoning", {"content": ch, "delta": ch, "ts": _next_ts()})
     if decided or override:
-        yield ("tool_call", {
-            "id": f"retrieve-{_next_ts()}",
-            "name": "hybrid_retrieve",
-            "args": {"query": value["query"]},
-            "result": (
-                {k: tr[k] for k in ("source_count", "max_score", "confidence_band")}
-                if tr else {}
-            ),
-            "status": value.get("tool_status") or "ok",
-            # 意图透传与真实 tool_call 事件一致，防前端误判"已检索但空"提示（见函数 docstring）
-            "intent": value.get("intent"),
-            "non_doc_question": value.get("non_doc_question"),
-            "ts": _next_ts(),
-        })
-        if tr and tr["source_count"] > 0:
-            yield ("sources", {"sources": value["sources"], "ts": _next_ts()})
+        # 逐轮重放 tool_call + sources（真实事件序：首轮检索 → 二次检索各一轮）
+        for tr in tool_rounds:
+            yield ("tool_call", {
+                "id": f"retrieve-{_next_ts()}",
+                "name": "hybrid_retrieve",
+                "args": {"query": tr["query"]},
+                "result": (
+                    {k: tr["result"][k] for k in ("source_count", "max_score", "confidence_band")}
+                    if tr.get("result") else {}
+                ),
+                "status": tr.get("status") or "ok",
+                # 意图透传与真实 tool_call 事件一致，防前端误判"已检索但空"提示（见函数 docstring）
+                "intent": value.get("intent"),
+                "non_doc_question": value.get("non_doc_question"),
+                "ts": _next_ts(),
+            })
+            if tr.get("result") and tr["result"]["source_count"] > 0:
+                yield ("sources", {"sources": tr.get("sources") or [], "ts": _next_ts()})
     for ch in value.get("reasoning_round2") or []:
         yield ("reasoning", {"content": ch, "delta": ch, "ts": _next_ts()})
     for ch in value["answer"]:

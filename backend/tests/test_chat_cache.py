@@ -40,10 +40,15 @@ def _reset(monkeypatch):
 
 def _payload(**overrides):
     p = {
-        "decided_retrieve": True, "rule_override": False, "query": "q",
-        "tool_status": "ok",
-        "tool_result": {"source_count": 1, "max_score": 0.9, "confidence_band": "high"},
-        "sources": [],
+        "decided_retrieve": True, "rule_override": False,
+        # v3 结构：工具轮次按序记录（命中路径可多轮），replay 逐轮重放 tool_call/sources
+        "tool_rounds": [
+            {
+                "query": "q", "status": "ok",
+                "result": {"source_count": 1, "max_score": 0.9, "confidence_band": "high"},
+                "sources": [],
+            },
+        ],
         "reasoning_round1": "思", "reasoning_round2": "考",
         "intent": "query", "non_doc_question": False,
         "answer": "答",
@@ -51,6 +56,11 @@ def _payload(**overrides):
     }
     p.update(overrides)
     return p
+
+
+def _tool_round(query="q", status="ok", result=None, sources=None):
+    """构造单条工具轮次记录（v3 tool_rounds 元素）"""
+    return {"query": query, "status": status, "result": result, "sources": sources or []}
 
 
 def test_key_stable_and_library_isolated(monkeypatch):
@@ -185,8 +195,8 @@ def test_replay_events_empty_hit_smalltalk_intent_passthrough():
     前端 ChatView 判断（intent!=='smalltalk' 且 !non_doc_question）会误触发 empty 提示。
     """
     value = _payload(
-        tool_result={"source_count": 0, "max_score": None, "confidence_band": "none"},
-        sources=[], reasoning_round1="", reasoning_round2="",
+        tool_rounds=[_tool_round(result={"source_count": 0, "max_score": None, "confidence_band": "none"})],
+        reasoning_round1="", reasoning_round2="",
         answer="你好，我是文档问答助手。",
         intent="smalltalk", non_doc_question=True,
     )
@@ -199,8 +209,8 @@ def test_replay_events_empty_hit_smalltalk_intent_passthrough():
 def test_replay_events_not_found_empty_retrieve():
     """检索空（source_count=0）：重放 tool_call + token(固定话术)，不发 sources"""
     value = _payload(
-        tool_result={"source_count": 0, "max_score": None, "confidence_band": "none"},
-        sources=[], reasoning_round1="", reasoning_round2="",
+        tool_rounds=[_tool_round(result={"source_count": 0, "max_score": None, "confidence_band": "none"})],
+        reasoning_round1="", reasoning_round2="",
         answer="根据当前文档库的内容，未找到与您问题直接相关的信息。",
     )
     events = list(cc.replay_events(value))
@@ -212,10 +222,55 @@ def test_replay_events_not_found_empty_retrieve():
 
 def test_replay_events_direct_answer_no_tool():
     """LLM 直接答路径（未检索/非文档问题）：无 tool_call/sources，仅 token + usage"""
-    value = _payload(decided_retrieve=False, rule_override=False, tool_result=None, tool_status=None)
+    value = _payload(decided_retrieve=False, rule_override=False, tool_rounds=[])
     events = list(cc.replay_events(value))
     types = [t for t, _ in events]
     # 直接答路径：reasoning* → token* → usage，无 tool_call/sources（reasoning 可非空）
     assert "reasoning" in types and "token" in types and types[-1] == "usage"
     assert "tool_call" not in types and "sources" not in types
     assert events[-1][1]["cached"] is True
+
+
+# ════════ 3161 修复：v2 旧缓存失效（改动 3 缓存结构 bump）+ 多轮 tool_rounds 重放（改动 2） ════════
+
+
+def test_get_v2_legacy_cache_invalidated(monkeypatch):
+    """改动3：_CACHE_VERSION 2→3 后，v2 旧结构缓存（含 3030 坏条目的单轮 tool_result）应视为未命中自动作废"""
+    _reset(monkeypatch)
+    fake = _FakeRedis()
+    monkeypatch.setattr(cc, "_client", lambda: fake)
+    legacy = json.dumps({
+        "v": 2,
+        "decided_retrieve": True, "rule_override": False,
+        # v2 旧结构：单轮 tool_status/tool_result/sources（无 tool_rounds 列表）
+        "query": "q", "tool_status": "ok",
+        "tool_result": {"source_count": 1, "max_score": 0.9, "confidence_band": "high"},
+        "sources": [], "reasoning_round1": "", "reasoning_round2": "",
+        "intent": "query", "non_doc_question": False,
+        "answer": "坏答案残留 DSML 声明", "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+    }, ensure_ascii=False)
+    fake._d[cc._key(7, "q")] = legacy
+    assert cc.get_cached(7, "q") is None, "bump 后 v2 旧缓存（含坏条目）应自动失效"
+
+
+def test_replay_events_multi_round_tool_rounds():
+    """改动2：二次检索缓存重放——tool_call/sources 按工具轮次顺序逐轮发出，仅命中轮发 sources"""
+    value = _payload(
+        tool_rounds=[
+            _tool_round(query="首查",
+                        result={"source_count": 1, "max_score": 0.9, "confidence_band": "high"}),
+            _tool_round(query="二次",
+                        result={"source_count": 0, "max_score": None, "confidence_band": "none"}),
+        ],
+        reasoning_round1="", reasoning_round2="",
+        answer="最终答案",
+    )
+    events = list(cc.replay_events(value))
+    types = [t for t, _ in events]
+    tcs = [d for t, d in events if t == "tool_call"]
+    assert len(tcs) == 2, f"多轮检索应重放 2 次 tool_call，实际 {len(tcs)}"
+    assert [tc["args"]["query"] for tc in tcs] == ["首查", "二次"]
+    assert types.count("sources") == 1, "仅首轮 source_count>0 应发 1 次 sources"
+    assert types.index("sources") < types.index("token")
+    assert types[-1] == "usage"
+    assert "".join(d["content"] for t, d in events if t == "token") == "最终答案"

@@ -3,7 +3,9 @@
 流式解析与首轮重试逻辑从 chat_service 下沉到资源层 llm_service，测试随函数迁移：
 SSE 行解析、HTTP 错误显式化、瞬时错误退避重试，均直接测本层函数，
 mock httpx.stream / patch 本层 stream_chat，无需真实 DeepSeek。
+改动1：DSML（DeepSeek V4 工具调用标记）变体识别、跨 chunk 分片累积、残留检测。
 """
+import json
 import sys
 
 import httpx
@@ -183,3 +185,116 @@ def test_stream_round1_max_attempts_follows_config(monkeypatch):
     with pytest.raises(httpx.HTTPStatusError):
         list(ls.stream_round1_with_retry([{"role": "user", "content": "问题"}]))
     assert calls["n"] == 5, "总调用次数应等于配置值（含首次）"
+
+
+# ---- 改动1：DSML（DeepSeek V4 工具调用标记）变体识别 / 跨 chunk 分片 / 残留检测 ----
+# 全角竖线 U+FF5C（｜）。实测 DeepSeek V4 退化变体为双全角竖线+DSML 标记
+#（<｜｜DSML｜｜tool_calls>），标准 DSML 为单全角竖线（<｜DSML｜tool_calls>），另有
+# ASCII 单/双竖线（<|DSML|...> / <||DSML||...>）共四种组合。marker 即竖线组合 + "DSML"。
+_DSML_FULLW = "｜｜DSML｜｜"  # 双全角竖线（实测 DeepSeek V4 退化变体）
+_DSML_MARKERS_TABLE = (_DSML_FULLW, "｜DSML｜", "||DSML||", "|DSML|")
+
+
+def _dsml_block(marker):
+    """按竖线分隔符变体构造完整 DSML 工具调用块（marker 含竖线组合 + "DSML"，含一个 hybrid_retrieve 调用）"""
+    return (
+        f"<{marker}tool_calls>"
+        f"<{marker}invoke name=\"hybrid_retrieve\">"
+        f"<{marker}parameter name=\"query\">工资发放日</{marker}parameter>"
+        f"</{marker}invoke>"
+        f"</{marker}tool_calls>"
+    )
+
+
+def test_normalize_tool_call_block_dsml_variants():
+    """改动1：四种 DSML 竖线变体（双/单全角、ASCII 双/单）+ 标准 XML 全部归一化解析"""
+    for marker in _DSML_MARKERS_TABLE:
+        parsed = ls._normalize_tool_call_block(_dsml_block(marker))
+        assert parsed is not None, f"DSML 变体 marker={marker!r} 应解析成功"
+        assert parsed[0]["function"]["name"] == "hybrid_retrieve"
+        assert parsed[0]["function"]["arguments"] == '{"query": "工资发放日"}', marker
+    # 标准 XML（不带 DSML 标记）沿用原解析路径
+    std = '<tool_calls><invoke name="hybrid_retrieve"><parameter name="query">a</parameter></invoke></tool_calls>'
+    parsed = ls._normalize_tool_call_block(std)
+    assert parsed[0]["function"]["name"] == "hybrid_retrieve"
+    assert parsed[0]["function"]["arguments"] == '{"query": "a"}'
+
+
+def test_normalize_tool_call_block_multiline():
+    """改动1：块内含换行（re.S 容忍）仍解析成功（gq 单工具场景）"""
+    m = _DSML_FULLW
+    block = (
+        f"<{m}tool_calls>\n"
+        f"  <{m}invoke name=\"hybrid_retrieve\">\n"
+        f"    <{m}parameter name=\"query\">发薪日</{m}parameter>\n"
+        f"  </{m}invoke>\n"
+        f"</{m}tool_calls>"
+    )
+    parsed = ls._normalize_tool_call_block(block)
+    assert parsed is not None
+    assert parsed[0]["function"]["name"] == "hybrid_retrieve"
+    assert parsed[0]["function"]["arguments"] == '{"query": "发薪日"}'
+
+
+def test_stream_chat_dsml_chunked_tool_call(monkeypatch):
+    """改动1：DSML 开标签跨 chunk 分片（< 与 ｜｜DSML 与 ｜｜tool_calls> 分开到达）累积为完整块 → tool_call 事件"""
+    m = _DSML_FULLW
+    # 显式分片：开标签被拆成 "<" + "｜｜DSML" + "｜｜tool_calls>" 三片，模拟网络分片
+    parts = [
+        "<",
+        "｜｜DSML",
+        "｜｜tool_calls>",
+        f"<{m}invoke name=\"hybrid_retrieve\">",
+        f"<{m}parameter name=\"query\">",
+        "工资发放日",
+        f"</{m}parameter></{m}invoke></{m}tool_calls>",
+    ]
+    lines = [
+        "data: " + json.dumps({"choices": [{"delta": {"content": p}}]}, ensure_ascii=False)
+        for p in parts
+    ]
+    lines += [
+        'data: {"choices":[{"delta":{}}],"usage":{"prompt_tokens":3,"completion_tokens":5,"total_tokens":8}}',
+        "data: [DONE]",
+    ]
+    monkeypatch.setattr(httpx, "stream", lambda *a, **k: _stream_lines_resp(lines))
+
+    events = list(ls.stream_chat([{"role": "user", "content": "工资发放日是哪天"}]))
+    tcs = [e for e in events if e["type"] == "tool_call"]
+    assert len(tcs) == 1, "跨 chunk 分片的 DSML 应累积出恰好一个 tool_call 事件"
+    assert tcs[0]["tool_calls"][0]["function"]["name"] == "hybrid_retrieve"
+    assert tcs[0]["tool_calls"][0]["function"]["arguments"] == '{"query": "工资发放日"}'
+    leaks = [e["content"] for e in events if e["type"] == "content"]
+    assert leaks == [], f"DSML 不应泄漏进 content，实际泄漏 {leaks!r}"
+
+
+def test_stream_chat_dsml_in_content_no_leak(monkeypatch):
+    """改动1：content 渲染完整 DSML 块（无 finish_reason）→ 仍解析为 tool_call 事件，声明不泄漏"""
+    block = _dsml_block(_DSML_FULLW)
+    lines = [
+        "data: " + json.dumps({"choices": [{"delta": {"content": block}}]}, ensure_ascii=False),
+        'data: {"choices":[{"delta":{}}],"usage":{"prompt_tokens":3,"completion_tokens":5,"total_tokens":8}}',
+        "data: [DONE]",
+    ]
+    monkeypatch.setattr(httpx, "stream", lambda *a, **k: _stream_lines_resp(lines))
+
+    events = list(ls.stream_chat([{"role": "user", "content": "工资发放日是哪天"}]))
+    tcs = [e for e in events if e["type"] == "tool_call"]
+    assert len(tcs) == 1, "单 chunk 完整 DSML 块应解析出 tool_call 事件"
+    leaks = [e["content"] for e in events if e["type"] == "content"]
+    assert leaks == [], f"DSML 不应泄漏进 content，实际泄漏 {leaks!r}"
+
+
+def test_has_tool_call_markup_detects_residual():
+    """改动3/4：answer 残留工具调用声明（完整块/未闭合开标签/DSML 变体）检出；普通正文不误报"""
+    # 完整标准块、未闭合开标签、DSML 变体开标签
+    assert ls.has_tool_call_markup('<tool_calls><invoke name="hybrid_retrieve">..</tool_calls>')
+    assert ls.has_tool_call_markup("<tool_calls>未闭合声明")
+    assert ls.has_tool_call_markup(f"我再查一下<{_DSML_FULLW}tool_calls>")
+    # 普通正文 / 空串不误报（实现只认 tool_calls 开标签/完整块，孤立 invoke 片段不识别）
+    assert not ls.has_tool_call_markup("")
+    assert not ls.has_tool_call_markup("根据文档，工资发放日为每月 10 号。")
+    assert not ls.has_tool_call_markup("a < b 且 c > d")
+    isolated_invoke = "<" + "in" + "voke name=\"hybrid_retrieve\">"
+    assert not ls.has_tool_call_markup(isolated_invoke)
+
