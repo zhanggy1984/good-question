@@ -61,6 +61,41 @@ def _validate_secrets() -> None:
         logger.warning("DEEPSEEK_API_KEY 未配置，聊天功能不可用（服务仍可启动）")
 
 
+def _obs():
+    """惰性取 obs_sdk 模块：未启用（env 缺配置）或未安装时返回 None。
+
+    观测边带不阻塞业务（§11.3 接入）：obs 装配是可选增强，配置缺失/包缺失都
+    让服务照常跑，只在本函数短路返回 None。放在模块级而非 lifespan——request
+    中间件（http 层，与 lifespan 无关）也要在每请求时快速判是否走观测。
+    """
+    if not (settings.obs_enabled and settings.obs_kafka_servers and settings.obs_kafka_topic):
+        return None
+    try:
+        import obs_sdk
+    except ImportError:
+        logger.warning("[obs] obs_sdk 未安装，观测边带关闭（OBS_ENABLED=true 但包缺失）")
+        return None
+    return obs_sdk
+
+
+def _obs_end(obs, response, request, aborted: bool = False, exc: Exception | None = None) -> None:
+    """request 出口统一收口：断连 > HTTP 状态码 > ok。
+
+    SSE 业务层断连（api/chat 已在断连处置 request.state.obs_aborted）与 body 迭代异常
+    （客户端中途关闭未走业务层）都归 error + CLIENT_DISCONNECT——trace 如实反映
+    「未拿到完整响应」；非 2xx 按 HTTP_xxx 记 error；其余 ok。end_request 会自己判
+    status 合法性/补 duration，此处不重复。
+    """
+    if aborted or getattr(request.state, "obs_aborted", False):
+        obs.end_request("error", error_type="CLIENT_DISCONNECT", error_msg="客户端连接中断")
+        return
+    code = response.status_code
+    if code >= 400:
+        obs.end_request("error", error_type=f"HTTP_{code}")
+        return
+    obs.end_request("ok")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """应用生命周期管理：启动时初始化资源，关闭时清理"""
@@ -116,9 +151,33 @@ async def lifespan(app: FastAPI):
             settings.chat_cleanup_interval_seconds,
         )
 
+    # obs_sdk 装配（观测边带）：root 日志体系（main 顶部 basicConfig + install）已装好，
+    # log_mode=stdlib 由 init 自动挂 Handler（DEBUG 不上报）。init 失败仅告警不阻塞启动。
+    obs = _obs()
+    if obs is not None:
+        try:
+            obs.init(
+                "good-question",
+                kafka_servers=settings.obs_kafka_servers,
+                topic=settings.obs_kafka_topic,
+                sasl_username=settings.obs_kafka_sasl_username or None,
+                sasl_password=settings.obs_kafka_sasl_password or None,
+                flush_batch=settings.obs_flush_batch,
+                flush_interval_s=settings.obs_flush_interval_s,
+                log_mode="stdlib",
+            )
+            logger.info("[lifespan] obs_sdk 已初始化 topic=%s", settings.obs_kafka_topic)
+        except Exception as e:  # 观测边带故障不拦服务启动
+            logger.warning("[lifespan] obs_sdk init 失败（观测边带关闭）: %s", e)
+
     yield
     if settings.chat_cleanup_enabled:
         await chat_cleaner.stop()
+    if obs is not None:
+        try:
+            obs.shutdown()  # 终刷剩余事件后关线程（幂等：未 init 也安全）
+        except Exception as e:
+            logger.warning("[lifespan] obs_sdk shutdown 异常: %s", e)
     logger.info("[lifespan] Native RAG 关闭")
 
 
@@ -167,6 +226,50 @@ async def security_headers_middleware(request: Request, call_next):
         "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; "
         "img-src 'self' data:; font-src 'self' data:; connect-src 'self'",
     )
+    return response
+
+
+@app.middleware("http")
+async def obs_request_middleware(request: Request, call_next):
+    """观测 request 入口/出口（§11.3 gq #2）：SSE 在 handler 出口聚合打一条。
+
+    - begin_request：method/path 交给 SDK 归一 interface（动态段 → {id}）；trace_id 沿用
+      网关透传 X-Request-ID（trace_middleware 同源，无则 SDK 自造）。
+    - end_request 时点：StreamingResponse 的 body 迭代完成才收口——SSE 的 LLM 调用发生在
+      response body 发送期（call_next 返回时尚未开始），若即时 end 则 request duration≈0
+      且锚点(seq=0)晚于子节点事件。包一层透传迭代器，真实流式不缓冲。
+    - 客户端断连：gq 的 api/chat 在业务层已消化（置 request.state.obs_aborted → 记
+      error+CLIENT_DISCONNECT）；body 迭代异常（上传中断等）同记。未启用时零开销直通。
+    """
+    obs = _obs()
+    if obs is None:
+        return await call_next(request)
+
+    obs.begin_request(method=request.method, path=request.url.path,
+                      trace_id=request.headers.get("X-Request-ID"))
+    try:
+        response = await call_next(request)
+    except Exception:
+        obs.end_request("error", error_type="UNHANDLED_EXCEPTION")
+        raise
+
+    body_iter = getattr(response, "body_iterator", None)
+    if body_iter is None:
+        # 非流式响应体已整体生成：直接收口（status_code 即可判定）
+        _obs_end(obs, response, request)
+        return response
+
+    async def _body_with_obs():
+        try:
+            async for chunk in body_iter:
+                yield chunk
+        except BaseException:
+            _obs_end(obs, response, request, aborted=True)
+            raise
+        else:
+            _obs_end(obs, response, request)
+
+    response.body_iterator = _body_with_obs()
     return response
 
 

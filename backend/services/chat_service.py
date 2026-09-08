@@ -355,6 +355,34 @@ def _build_context(db: Session, session: ChatSession):
     return session.summary or "", history
 
 
+def _record_mem_llm(status: str, started_ms: float | None = None,
+                    result=None, error_type: str | None = None,
+                    error_msg: str | None = None) -> None:
+    """记忆压缩 LLM 调用观测（llm_call 覆盖，§11.3 gq invoke 实际核对）。
+
+    langchain ChatOpenAI.invoke 的内部退避（get_llm max_retries=2）在客户端层、SDK 不可见
+    → 只按「每逻辑调用」记最终 1 条（§11.1 attempt 不上报）。usage 从 OpenAI 兼容的
+    response_metadata.token_usage 映射；取不到则 SDK 全 0 占位。观测边带缺失时静默 no-op。
+    """
+    try:
+        import obs_sdk
+        if not obs_sdk.is_initialized():
+            return
+    except ImportError:
+        return
+    duration_ms = None if started_ms is None else int((time.time() - started_ms) * 1000)
+    usage = None
+    if result is not None:
+        tu = (getattr(result, "response_metadata", None) or {}).get("token_usage") or {}
+        usage = {
+            "prompt_tokens": tu.get("prompt_tokens") or 0,
+            "completion_tokens": tu.get("completion_tokens") or 0,
+            "total_tokens": tu.get("total_tokens") or 0,
+        }
+    obs_sdk.record_llm(settings.deepseek_model, status, duration_ms=duration_ms,
+                       usage=usage, error_type=error_type, error_msg=error_msg)
+
+
 def _compress_memory(db: Session, session: ChatSession) -> None:
     """超过 10 轮：旧消息 + 现有摘要压缩为新摘要（保留最近 3 轮原文）"""
     # 同 created_at 秒级排序不稳定，用自增主键保证插入顺序（见 _build_context 注释）
@@ -378,13 +406,17 @@ def _compress_memory(db: Session, session: ChatSession) -> None:
 {dialogue}
 
 请输出压缩后的摘要（不超过 200 字）："""
+    started = time.time()
     try:
         llm = get_llm(streaming=False)
-        new_summary = llm.invoke(compress_prompt).content.strip()
+        result = llm.invoke(compress_prompt)
+        new_summary = result.content.strip()
         session.summary = new_summary
         db.commit()
+        _record_mem_llm("ok", started, result=result)
         logger.debug("[memory] 会话 %s 记忆已压缩", session.id)
     except Exception as e:
+        _record_mem_llm("error", started, error_type="LLM_ERROR", error_msg=str(e))
         logger.warning("[memory] 压缩失败: %s", e)
 
 

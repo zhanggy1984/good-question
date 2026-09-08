@@ -195,7 +195,61 @@ def _tool_call_event(tool_acc: dict) -> dict:
 
 
 def stream_chat(messages: list[dict], tools: list[dict] | None = None):
-    """直连 DeepSeek 流式调用，解析 reasoning_content / content / tool_calls / usage
+    """直连 DeepSeek 流式调用（观测旁路包装，§11.3 gq llm_call 覆盖）。
+
+    对底层每条真实 HTTP 流（_stream_chat_http）产出 1 条 llm_call：正常流末 record_llm ok
+    （收流末 usage chunk 的 token 计数）；裸异常**先记 error 再抛**（§2.4 前提）。chat_service
+    层 stream_round1_with_retry 的每次重试都是完整付费调用 → 各记 1 条（失败尝试不掩盖）。
+    观测边带：obs_sdk 未安装/未 init（_obs_sdk() 返 None）时零开销直通，调用语义与原先完全一致。
+    """
+    obs = _obs_sdk()
+    if obs is None:
+        yield from _stream_chat_http(messages, tools=tools)
+        return
+    started = time.time()
+    usage: dict = {}
+    try:
+        for ev in _stream_chat_http(messages, tools=tools):
+            if ev.get("type") == "usage":
+                usage = ev["usage"] or {}
+            yield ev
+    except Exception as exc:
+        obs.record_llm(
+            settings.deepseek_model, "error",
+            duration_ms=int((time.time() - started) * 1000),
+            error_type=_llm_error_type(exc), error_msg=str(exc),
+        )
+        raise
+    obs.record_llm(
+        settings.deepseek_model, "ok",
+        duration_ms=int((time.time() - started) * 1000),
+        usage=usage or None,
+    )
+
+
+def _obs_sdk():
+    """惰性取已 init 的 obs_sdk：未安装 / 未 init 返回 None（观测边带不阻塞业务、测试免装依赖）。"""
+    try:
+        import obs_sdk
+    except ImportError:
+        return None
+    return obs_sdk if obs_sdk.is_initialized() else None
+
+
+def _llm_error_type(exc: Exception) -> str:
+    """异常 → llm_call error_type（平台聚类用，自由字符串）：HTTP 错误带状态码，超时/网络分型。"""
+    if isinstance(exc, httpx.HTTPStatusError):
+        resp = getattr(exc, "response", None)
+        return f"HTTP_{resp.status_code}" if resp is not None else "HTTP_ERROR"
+    if isinstance(exc, httpx.TimeoutException):
+        return "TIMEOUT"
+    if isinstance(exc, httpx.TransportError):
+        return "NETWORK"
+    return "LLM_ERROR"
+
+
+def _stream_chat_http(messages: list[dict], tools: list[dict] | None = None):
+    """直连 DeepSeek 流式调用（真实 HTTP 层），解析 reasoning_content / content / tool_calls / usage
 
     yield {"type": "reasoning"|"content"|"tool_call"|"usage", ...}
     - reasoning/content：增量文本
