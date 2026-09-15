@@ -197,8 +197,8 @@ def _tool_call_event(tool_acc: dict) -> dict:
 def stream_chat(messages: list[dict], tools: list[dict] | None = None):
     """直连 DeepSeek 流式调用（观测旁路包装，§11.3 gq llm_call 覆盖）。
 
-    对底层每条真实 HTTP 流（_stream_chat_http）产出 1 条 llm_call：正常流末 record_llm ok
-    （收流末 usage chunk 的 token 计数）；裸异常**先记 error 再抛**（§2.4 前提）。chat_service
+    对底层每条真实 HTTP 流（_stream_chat_http）产出 1 条 llm_call：**流穷尽**与**中途被弃用**
+    两条出口都记 ok（后者 usage 可能为空，见下）；裸异常**先记 error 再抛**（§2.4 前提）。chat_service
     层 stream_round1_with_retry 的每次重试都是完整付费调用 → 各记 1 条（失败尝试不掩盖）。
     观测边带：obs_sdk 未安装/未 init（_obs_sdk() 返 None）时零开销直通，调用语义与原先完全一致。
     """
@@ -208,23 +208,33 @@ def stream_chat(messages: list[dict], tools: list[dict] | None = None):
         return
     started = time.time()
     usage: dict = {}
+    # 已记账标志：异常分支必须置位，否则 finally 会把同一次调用再记一条 ok（一次调用两条账）
+    recorded = False
     try:
         for ev in _stream_chat_http(messages, tools=tools):
             if ev.get("type") == "usage":
                 usage = ev["usage"] or {}
             yield ev
     except Exception as exc:
+        recorded = True
         obs.record_llm(
             settings.deepseek_model, "error",
             duration_ms=int((time.time() - started) * 1000),
             error_type=llm_error_type(exc), error_msg=str(exc),
         )
         raise
-    obs.record_llm(
-        settings.deepseek_model, "ok",
-        duration_ms=int((time.time() - started) * 1000),
-        usage=usage or None,
-    )
+    finally:
+        # ok 收口**必须在 finally**：客户端断连时 chat.py 层 gen.close() 抛 GeneratorExit 在
+        # 上面的 yield 点，它承 BaseException、except Exception 接不住 ⇒ 写在 try 之后的收口
+        # 会静默全丢，而中途弃用恰是真实断连下**唯一**会走的出口（真机对照：截断驱动零
+        # llm_call，完整 drain 才有）。usage 为空仅出现在断连早于流末 usage chunk 时——
+        # 此时调用本身已成功（HTTP 200 且已产出增量），按 ok 记；§13.0 #3「无黑洞」。
+        if not recorded:
+            obs.record_llm(
+                settings.deepseek_model, "ok",
+                duration_ms=int((time.time() - started) * 1000),
+                usage=usage or None,
+            )
 
 
 def _obs_sdk():

@@ -2,8 +2,9 @@
 
 直通路径（_obs_sdk() 返 None，即未装/未 init）由现有 LLM 流测试在 mock httpx 下天然覆盖
 （94 个用例全绿即为无观测时调用语义不变的证明），本文件只验证**启用观测**分支：
-- 正常流末：record_llm ok + usage token 透传 + duration 计算
+- 流穷尽：record_llm ok + usage token 透传 + duration 计算
 - 流中异常：record_llm error 先记再抛（§2.4 前提）、error_type 按异常分型
+- 流中途被弃用（客户端断连 → gen.close()）：record_llm ok 仍须记账（§13.0 #3 无黑洞）
 全程 monkeypatch _obs_sdk/_stream_chat_http，不触真实 HTTP、不依赖 sdk 安装。
 """
 import httpx
@@ -66,6 +67,31 @@ def test_obs_records_error_then_raises(monkeypatch):
     assert call["error_type"] == "llm_timeout", "httpx 超时应分型 llm_timeout（平台白名单词）"
     assert call["error_msg"] == "上游超时"
     assert call["usage"] is None
+
+
+def test_obs_records_ok_on_midstream_close(monkeypatch):
+    """客户端中途断连（chat.py 的 gen.close()）：ok 收口仍须记账。
+
+    GeneratorExit 落在 yield 点且承 BaseException，except Exception 接不住 ⇒ 收口若写在
+    try 之后会静默全丢。**真机对照**（2026-09-15 gq 容器）：截断驱动的请求只有 request、
+    零 llm_call；完整 drain 的请求 request + llm_call ok —— 本用例即该对照的单测复现。
+    """
+    fake = _FakeObs()
+    monkeypatch.setattr(llm_service, "_obs_sdk", lambda: fake)
+
+    def _fake_stream(messages, tools=None):
+        yield {"type": "content", "content": "hello"}
+        yield {"type": "usage", "usage": {"total_tokens": 15}}
+
+    monkeypatch.setattr(llm_service, "_stream_chat_http", _fake_stream)
+    gen = stream_chat([])
+    assert next(gen)["content"] == "hello", "只驱动一步 = 断连现场"
+    gen.close()  # 等价于 chat.py _stream_with_disconnect_check 的 finally 分支
+
+    assert len(fake.calls) == 1, "一次调用一条账（既不能丢，也不能 finally 重复记）"
+    call = fake.calls[0]
+    assert call["status"] == "ok", "调用已成功（HTTP 200 且已产出增量）⇒ ok，不是 error"
+    assert call["usage"] is None, "断连早于 usage chunk ⇒ usage 空，但状态仍为 ok"
 
 
 def test_obs_untouched_on_http_status_error(monkeypatch):
