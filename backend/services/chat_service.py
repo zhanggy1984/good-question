@@ -21,6 +21,7 @@ from services.chat_cache import get_cached, replay_events, set_cached
 from services.llm_service import (
     get_llm,
     has_tool_call_markup,
+    llm_error_type,
     stream_chat as llm_stream_chat,
     stream_round1_with_retry as llm_stream_round1_with_retry,
 )
@@ -416,7 +417,7 @@ def _compress_memory(db: Session, session: ChatSession) -> None:
         _record_mem_llm("ok", started, result=result)
         logger.debug("[memory] 会话 %s 记忆已压缩", session.id)
     except Exception as e:
-        _record_mem_llm("error", started, error_type="LLM_ERROR", error_msg=str(e))
+        _record_mem_llm("error", started, error_type=llm_error_type(e), error_msg=str(e))
         logger.warning("[memory] 压缩失败: %s", e)
 
 

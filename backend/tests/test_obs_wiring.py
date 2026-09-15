@@ -63,13 +63,13 @@ def test_obs_records_error_then_raises(monkeypatch):
     assert len(fake.calls) == 1
     call = fake.calls[0]
     assert call["status"] == "error"
-    assert call["error_type"] == "TIMEOUT", "httpx 超时应分型 TIMEOUT"
+    assert call["error_type"] == "llm_timeout", "httpx 超时应分型 llm_timeout（平台白名单词）"
     assert call["error_msg"] == "上游超时"
     assert call["usage"] is None
 
 
 def test_obs_untouched_on_http_status_error(monkeypatch):
-    """非 2xx（resp.raise_for_status 抛 HTTPStatusError）→ HTTP_<code> 分型。"""
+    """非 2xx（resp.raise_for_status 抛 HTTPStatusError）→ 仅 429 单列，其余归 llm_other。"""
     fake = _FakeObs()
     monkeypatch.setattr(llm_service, "_obs_sdk", lambda: fake)
 
@@ -84,4 +84,33 @@ def test_obs_untouched_on_http_status_error(monkeypatch):
     with pytest.raises(_hx.HTTPStatusError):
         list(stream_chat([]))
     assert fake.calls[0]["status"] == "error"
-    assert fake.calls[0]["error_type"] == "HTTP_429"
+    assert fake.calls[0]["error_type"] == "llm_rate_limit"
+
+
+# 平台错误分类白名单（§4.3 L1+L2 词表）。llm_call 的 error_type 若落在此集合外，
+# 平台不产生回流候选 ⇒ 值域卫生是本表唯一护栏。
+_PLATFORM_ERR_WHITELIST = {
+    "llm_timeout", "llm_rate_limit", "llm_connection", "llm_context_exceeded",
+    "llm_empty_response", "llm_parse_error", "llm_other",
+    "llm_interface_business", "external_non_llm", "db_error", "redis_error",
+}
+
+
+def _status_error(code: int) -> httpx.HTTPStatusError:
+    resp = httpx.Response(code, request=httpx.Request("POST", "http://x/chat"))
+    return httpx.HTTPStatusError("boom", request=resp.request, response=resp)
+
+
+@pytest.mark.parametrize("exc,expected", [
+    (httpx.TimeoutException("上游超时"), "llm_timeout"),
+    (httpx.ConnectError("连接失败"), "llm_connection"),
+    (_status_error(429), "llm_rate_limit"),
+    (_status_error(500), "llm_other"),
+    (_status_error(401), "llm_other"),
+    (ValueError("别的东西"), "llm_other"),
+])
+def test_llm_error_type_maps_into_platform_whitelist(exc, expected):
+    """每条分支都必须产出白名单内的词（原实现透出 HTTP_{code}/TIMEOUT/NETWORK，均不在册）。"""
+    got = llm_service.llm_error_type(exc)
+    assert got == expected
+    assert got in _PLATFORM_ERR_WHITELIST, f"{got} 不在平台白名单，平台不会据此产生回流候选"

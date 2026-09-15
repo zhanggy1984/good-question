@@ -217,7 +217,7 @@ def stream_chat(messages: list[dict], tools: list[dict] | None = None):
         obs.record_llm(
             settings.deepseek_model, "error",
             duration_ms=int((time.time() - started) * 1000),
-            error_type=_llm_error_type(exc), error_msg=str(exc),
+            error_type=llm_error_type(exc), error_msg=str(exc),
         )
         raise
     obs.record_llm(
@@ -236,16 +236,22 @@ def _obs_sdk():
     return obs_sdk if obs_sdk.is_initialized() else None
 
 
-def _llm_error_type(exc: Exception) -> str:
-    """异常 → llm_call error_type（平台聚类用，自由字符串）：HTTP 错误带状态码，超时/网络分型。"""
+def llm_error_type(exc: Exception) -> str:
+    """异常 → llm_call error_type。
+
+    值域是平台错误分类白名单（七词），**不是自由字符串**：平台按白名单分层聚类，
+    非白名单值不产生回流候选。原始 HTTP 状态码由 error_msg 保留，故此处不透出码值。
+    三仓（cs/sp/contract-check）须保持同一口径。
+    """
     if isinstance(exc, httpx.HTTPStatusError):
         resp = getattr(exc, "response", None)
-        return f"HTTP_{resp.status_code}" if resp is not None else "HTTP_ERROR"
+        # 仅 429 单列（对应白名单 llm_rate_limit），其余码位无对应词、统一归 llm_other
+        return "llm_rate_limit" if resp is not None and resp.status_code == 429 else "llm_other"
     if isinstance(exc, httpx.TimeoutException):
-        return "TIMEOUT"
+        return "llm_timeout"
     if isinstance(exc, httpx.TransportError):
-        return "NETWORK"
-    return "LLM_ERROR"
+        return "llm_connection"
+    return "llm_other"
 
 
 def _stream_chat_http(messages: list[dict], tools: list[dict] | None = None):
