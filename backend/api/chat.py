@@ -49,6 +49,9 @@ def chat(
     current_user: User = Depends(get_current_user),
 ):
     """发送消息，SSE 流式返回（sources → token* → done）"""
+    # 观测入参（同 obs_aborted 惯例：业务置位 → 观测中间件出口读出）。**在校验之前置位**：
+    # 校验失败（403/404）也是一条要归因的 trace，同样需要现场，否则建不出簇。
+    request.state.obs_input = body.model_dump()
     # 用请求 db 校验会话归属（会话隔离）
     chat_service._get_owned_session(db, session_id, current_user.id)
     logger.debug("[chat] 入参 session_id=%s content=%.50s", session_id, body.content)

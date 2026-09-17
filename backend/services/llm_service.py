@@ -13,6 +13,7 @@ import httpx
 from langchain_openai import ChatOpenAI
 
 from config import settings
+from utils.trace import mark_llm_hard_fail, unmark_llm_hard_fail
 
 logger = logging.getLogger("native_rag")
 
@@ -217,6 +218,9 @@ def stream_chat(messages: list[dict], tools: list[dict] | None = None):
             yield ev
     except Exception as exc:
         recorded = True
+        # 请求级硬失败标记：本条流最终失败 ⇒ 用户本轮拿到的是 error 帧兜底话术，root 必须记
+        # error。放在 record_llm **之前**——即便记账本身抛异常，标记也已置位。
+        mark_llm_hard_fail(llm_error_type(exc))
         obs.record_llm(
             settings.deepseek_model, "error",
             duration_ms=int((time.time() - started) * 1000),
@@ -425,4 +429,7 @@ def stream_round1_with_retry(messages: list[dict], tools: list[dict] | None = No
                 "[llm] LLM 首轮瞬时错误，退避后重试（第 %s/%s 次）: %s",
                 attempt, max_attempts, e,
             )
+            # 撤销硬失败标记：走到这里 = 确定还会再调一次，若重试成功用户拿到完整回答，root
+            # 必须记 ok。不撤销 ⇒「首次 429 → 重试成功」被误标 error（假红）。
+            unmark_llm_hard_fail()
             time.sleep(settings.chat_llm_retry_backoff_seconds)
