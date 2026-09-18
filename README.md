@@ -2,10 +2,11 @@
 
 > **多用户 RAG 文档问答系统**：文档上传即自动抽取 → 清洗 → 切片 → 向量化，之后基于文档库提问，大模型用**带来源标注、流式返回**的答案作答。私有知识有出处、可溯源、不编造，会话与文档库双隔离。
 
-第一次接触这个项目，只看下面三句就够了：
+第一次接触这个项目，只看下面四句就够了：
 
 - **做什么**：把私有文档变成可问答的知识库。上传的每份文档都被自动切成片段并向量化，你只需像聊天一样提问，模型**只基于你的文档作答，答必带引用出处**。
 - **怎么做**：**LLM 自主决定是否检索**（function calling 编排）→ 命中检索则**混合检索 + 重排 + 置信分级** → 大模型带来源流式作答；规则护栏在"该查不查"和"查不到就编"两个口子上兜底。
+- **可观测**：问答链路按阶段落结构化观测事件（检索 → 重排 → 编排 → 生成），统一携带 `trace_id` / `seq` / `status` / `duration_ms` / `usage`，token 与耗时取自模型真实返回、不估算；链路上出过的问题会被自动固化成回归用例，形成 `观测 → 聚类 → 组装 → 拉取 → 判定 → 回归回推 → 收口` 的闭环。
 - **好在哪**：答必有据、不编造、多用户隔离、首包秒回；对外是契约对齐的 SSE 事件流，有 212 项单元测试 + 运行时契约验证脚本，开箱即验。
 
 ## 目录
@@ -22,6 +23,7 @@
 - [十、开发指南](#十开发指南)
 - [十一、常见问题](#十一常见问题)
 - [十二、已知限制与优化方向](#十二已知限制与优化方向)
+- [文档索引](#文档索引)
 
 ---
 
@@ -135,13 +137,13 @@ graph TB
 | 能力层 | `document/library/auth/dashboard/retrieval` | 有业务语义的操作：文档生命周期、知识库管理、检索编排 |
 | 资源层 | `llm/embedding/rerank/vector_store/llama_store/chat_cache/chat_cleanup/retrieval_types` + `models/` + `utils/` + `config.py` | 无业务语义的基础设施，向 LLM/向量库/缓存/ORM/配置抽象 |
 
-分层结构与调用方向见上图"后端四层架构"子图。三条依赖规则：**单向**（上层可依赖下层，下层绝不依赖上层，`services/` 任何模块不得 `import api/`）；**依赖抽象不依赖实现**（控制层只调能力层的公开接口编排，如检索工具 `execute_retrieve_tool` 是能力层对外契约，不直连资源层）；**数据流单向**（请求自交互层逐层下钻，结果自下而上返回）。
+三条依赖规则：**单向**（上层可依赖下层，下层绝不依赖上层，`services/` 任何模块不得 `import api/`）；**依赖抽象不依赖实现**（控制层只调能力层的公开接口编排，如检索工具 `execute_retrieve_tool` 是能力层对外契约，不直连资源层）；**数据流单向**（请求自交互层逐层下钻，结果自下而上返回）。
 
 依赖方向不是写死在文档里，而是被测试守护：`tests/test_architecture.py` 用 AST 静态解析 `services/` 全部模块的 import，四条规则（反向依赖禁止 / 资源层不依赖上层 / 能力层不依赖控制层 / 全部模块已归层）任一违反即测试失败——新增服务不归层、依赖方向错了，提交即被拦。
 
 分层是随重构逐步收敛的，不是一次性设计：检索结果组装（`execute_retrieve_tool`）下沉到能力层、LLM 流式解析与重试（`stream_chat`/`stream_round1_with_retry`）下沉到资源层、query 规则化清洗（`utils/query_normalizer`）下沉到资源层之后，控制层 `chat_service` 才收敛为纯编排——每轮下沉同步迁移对应单测，行为零变化（212 项单测全绿）。
 
-**收敛状态（如实）**：上图为**依赖规则（目标架构）**。当前控制层 `chat_service` 仍直连资源层 `llm_service` / `chat_cache` / `chat_cleanup`，交互层 `api/` 仍直连 `services` 与 `models`——这些越层调用正随重构逐项下沉到能力层，收敛后依赖严格为 交互→控制→能力→资源 单向、控制层不直连资源层。`tests/test_architecture.py` 守护的当前基线（反向依赖禁止 / 资源层不依赖上层 / 能力层不依赖控制层 / 全部模块已归层）将随收敛逐步收紧。
+**收敛状态（如实）**：上图为**依赖规则（目标架构）**。当前控制层 `chat_service` 仍直连资源层 `llm_service` / `chat_cache` / `chat_cleanup`，交互层 `api/` 仍直连 `services` 与 `models`——这些越层调用正随重构逐项下沉到能力层，收敛后依赖严格为 交互→控制→能力→资源 单向、控制层不直连资源层。`tests/test_architecture.py` 守护的这套基线将随收敛逐步收紧。
 
 ---
 
@@ -151,9 +153,11 @@ graph TB
 >
 > ```bash
 > # 发布物：clone infra 独立仓库后启动
-> git clone https://github.com/zhanggy1984/share-infra && cd infra && docker compose up -d
+> git clone https://github.com/zhanggy1984/share-infra && cd share-infra && docker compose up -d
+> cd api-gateway && docker compose up -d      # 统一网关是独立 compose，不在根 compose 内
 > # 本地开发：infra 位于 ../infra
 > cd ../infra && docker compose up -d
+> cd api-gateway && docker compose up -d
 > ```
 
 前置：Docker Desktop（Linux 容器）、Python 3.11（跑宿主机验证脚本用）。
@@ -223,14 +227,14 @@ open http://localhost:38000   # Attu：Milvus 可视化管理 UI（共享 infra�
 > 示例数据**客观可复现**：`test-data/seed_example.py` 一键重建"示例知识库"（删旧库 → 上传 4 份中文文档 → 等就绪 → 打印问题清单）。示例文档用 `.md`（抽取走明文读取，无需 MinerU），容器就绪即可秒级造数。
 
 ```bash
-docker compose up -d                   # 7 服务就绪（首次构建较久）
+docker compose up -d                   # 应用容器就绪（backend + nginx；首次构建较久）
 python test-data/seed_example.py       # 登录 → 重建示例库 → 上传 4 份文档 → 等就绪 → 打印问题清单
-open http://localhost                  # admin 登录 → 聊天页选"示例知识库" → 复制场景问题提问
+open http://localhost:8089             # admin 登录 → 聊天页选"示例知识库" → 复制场景问题提问
 ```
 
 幂等可重跑：重复执行会删除已存在的示例库并重建（会话/文档/向量级联清理），结果一致。
 
-> ⚠️ 示例/验证脚本默认以 `admin / 123456` 登录（`.env` `ADMIN_PASSWORD`）；若已修改 `ADMIN_PASSWORD`，请用环境变量 `RAG_ADMIN_USER` / `RAG_ADMIN_PASS` 覆盖后运行。
+> ⚠️ 示例/验证脚本以 `admin` 登录，密码取 `.env` 的 `ADMIN_PASSWORD`（`.env.example` 默认 `change_me_admin`，建议修改）；也可用环境变量 `RAG_ADMIN_USER` / `RAG_ADMIN_PASS` 覆盖后运行。
 
 ### 4.3 6 个示例场景
 
@@ -254,22 +258,38 @@ open http://localhost                  # admin 登录 → 聊天页选"示例知
 | `no_hit` 无命中兜底 | 场景 3 |
 | `summarize` 文档总结 | 场景 4 |
 
-**验收示例**（对运行中的服务）：
-
-```bash
-python verify_contract.py           # 契约事件流验证（meta → reasoning/token → [tool_call → sources]? → usage → done）
-python test-data/e2e.py             # 端到端：登录→建库→上传→轮询就绪
-python test-data/chat.py            # chat 完整链路：登录→建会话→提问→读 SSE 事件
-```
+**验收示例**：对运行中的服务执行契约验证与端到端脚本，命令见[第九章](#九测试与验收)。
 
 ---
 
 ## 五、技术闪光点
 
-### 1. LlamaIndex 统一混合检索：双存储合一
+### 1. 可观测接入：RAG 问答链路的端到端追踪
+
+系统接入统一的**可观测 SDK**，并接进平台的错误回流闭环，形成
+`观测 → 聚类 → 组装 → 拉取 → 判定 → 回归回推 → 收口` 的完整链路——
+**问答链路上出过的问题，会被自动固化成回归用例**。
+
+**观测埋点**
+- 问答链路按阶段落结构化事件：检索 → 重排 → 编排（Function Calling）→ 生成，
+  统一携带 `trace_id` / `seq` / `interface` / `status` / `error_type` / `duration_ms` / `usage`；
+- **token 与耗时取自模型真实返回**，不估算——这是后续判定"是真失败还是被兜底掩盖"的前提；
+- 埋点在路由层统一入口注入，避免多分支各自为政导致观测缺口。
+
+**与评测平台的双向契约**
+- **出**：暴露标准契约清单（`agent` / `interfaces` / `scenes`），平台脚手架自动发现，**平台零特判**；
+- **入**：错误事件回流平台后按输入归一聚类、生成回归用例，再由平台回推触发本仓回归。
+
+**闭环验证**
+
+以主动故障注入方式（把依赖域名指向黑洞地址，构造确定性 DNS / 连接类失败）完成端到端闭环验证：
+注入失败后，该 error 被自动观测、聚类、组装回流、复现判定、回归回推，直至收口闭环。
+该方式可重复、可对照，每一步均有落库产物可核。
+
+### 2. LlamaIndex 统一混合检索：双存储合一
 检索存储从 **ChromaDB（语义）+ Elasticsearch（全文）双存储**，迁移为 **Milvus 2.5 Standalone 单存储**，并由 **LlamaIndex 0.12** 统一托管：dense 语义（FastEmbed 768 维）+ **BGE-M3 学习稀疏**（替代服务端 BM25，query 与文档两端都编码，语义召回更准）在同一 collection 内混合检索，RRF 融合去重，**library_id 字段级过滤**做文档库隔离（替代 partition），可横向扩展。配套 `scripts/migrate_to_milvus.py` 幂等重灌脚本（按文档先删后灌，可重复执行）与 `test-data/verify_old_data.py` 迁移验证，升级不丢失数据。
 
-### 2. 两级置信档：防幻觉，也不误杀
+### 3. 两级置信档：防幻觉，也不误杀
 实测 Rerank 的**绝对分数不可靠**——最相关的片段可能只得 0.27 分，用绝对阈值会误杀（曾导致"明明检索到了却返回空"）。因此：
 
 - **相对排序取 top-3**，不做绝对阈值过滤；
@@ -277,13 +297,13 @@ python test-data/chat.py            # chat 完整链路：登录→建会话→�
 - **未命中不调 LLM**：实测空 context 下 DeepSeek 会**稳定编造**"合理答案"（曾把文档未提到的"工资发放日"编成每月 10 号），故检索为空时用 `_is_smalltalk()` 区分意图——**事实类查询直接返回固定"未找到"话术、不调用 LLM**（编造概率归零），仅问候/闲聊继续走 LLM 引导话术（带问候前缀的查询如"你好，工资几号发"不会被误判）；
 - **最高分 ∈ [0.2, 0.5)**（`RERANK_LOW_CONFIDENCE_THRESHOLD`）判"相关性存疑"——检索结果**照常保留**（保住召回、不误杀低分相关片段），但在 system prompt 追加提示，让 LLM"不足以回答就如实说未找到"，杜绝基于边缘相关片段编造。
 
-### 3. 直连 DeepSeek 流式：思考过程 + 真实 token
+### 4. 直连 DeepSeek 流式：思考过程 + 真实 token
 不用 LangChain `ChatOpenAI` 的流式（它拿不到 DeepSeek 的 `reasoning_content` 思考过程），改为 `httpx` **直连 DeepSeek 流式接口**逐行解析 SSE：
 
 - `reasoning_content`（思考过程）与 `content`（正式答案）分流推送，前端把思考过程单独折叠展示；
 - `stream_options.include_usage` 显式开启，透传**真实 token 消耗**（默认不返回），供计费与评测。
 
-### 4. Function Calling 编排 + SSE 事件流对齐评测契约
+### 5. Function Calling 编排 + SSE 事件流对齐评测契约
 `/api/chat/{session_id}` 采用**function calling 编排**：LLM 第一轮带 `hybrid_retrieve` 工具**自主决定是否检索**（不调就不检），命中后经 tool 消息回传结果、第二轮基于检索结果作答；检索空走规则意图分类兜底（query→如实"未找到"、unknown→引导澄清、smalltalk→LLM 引导寒暄），防幻觉不变（详见[第二章编排模式](#编排模式llm-自主决策--规则护栏)）。每次请求的 tool 决策以 JSON 行结构化日志落盘（`kind=tool_decision`），监控 LLM 决策与规则判断的一致性（`rule_agree`）。
 
 **三期规则否决权（F3）**：规则判"该查"（`rule_intent ∈ {query, unknown}`）而 LLM 决定不检索时，**规则否决 LLM 决策、强制检索**——把"事后监控不一致"升级为"主动拦截编造"。否决命中后因首轮 token 已流式发出无法撤回，第二轮以 user 消息携带检索 context 引导 LLM 重新作答（LLM 未产出 tool_calls，不能走 tool 消息回传），补答拼接在首轮之后；否决后检索仍空则走固定话术（query→"未找到"、unknown→澄清），防空 context 再编造。可通过环境变量 `RULE_OVERRIDE_ENABLED=false` 关闭回滚到"信任 LLM"。`tool_decision` 日志新增 `rule_override` 字段：`True` 表示本次检索为规则强制，与 `rule_agree=false` 组合即"不一致但已否决修正"。
@@ -312,18 +332,18 @@ event: error      LLM 调用失败兜底
 - 前端 `sse.ts` 只消费 `sources`/`reasoning`/`token`/`done`/`error`，新增的 `meta`/`tool_call`/`usage` 事件自然忽略——路径 A，前端无需改动；
 - **断连恢复**：`sse.ts` 网络中断抛 `StreamError`，上层提示用户重试，已渲染内容不丢失。
 
-### 5. MinerU 结构化解析 + 失败降级
+### 6. MinerU 结构化解析 + 失败降级
 中文 PDF / DOCX 用 **MinerU 3.4.4** 结构化解析，输出 Markdown 并保留标题层级（标题路径用于溯源展示）；解析失败自动降级 PyMuPDF / python-docx。本地解析 / 官方 API（`MINERU_API_TOKEN`）可切换，大 PDF 赶时间可走官方 API。
 
-### 6. 多轮记忆压缩：长对话不爆 prompt
+### 7. 多轮记忆压缩：长对话不爆 prompt
 - 上下文 = 最近 3 轮原文 + 压缩摘要 + 本次检索片段；
 - 超过 10 轮（20 条消息）自动把早期对话压成一段 ≤200 字摘要，只保留最近 3 轮原文——既不丢早期上下文，也不让 prompt 无限膨胀；
 - 历史消息按**自增主键 `id`** 排序而非 `created_at`（秒级时间戳排序不稳定，曾导致多轮问答"串味"——第二问答出第一问的内容），用 `id` 排序后彻底解决。
 
-### 7. 多用户会话隔离
+### 8. 多用户会话隔离
 会话归属后端强制校验：普通用户即使改 URL / 直接调 API，也拿不到不属于自己的会话（403）。检索范围以会话绑定库的 `library_id` 字段过滤，跨库天然隔离。
 
-### 8. 幂等异步文档管线：失败不残留
+### 9. 幂等异步文档管线：失败不残留
 上传后后台线程异步处理（不阻塞上传响应），6 个阶段：`落盘 → ①抽取 → ②清洗 → ③切片 → ④向量化 → ⑤写库 → ⑥就绪`。关键保证：
 
 - **按文档维度切分**：每篇文档在 `documents` 表存自己的 `chunk_size` / `overlap_token`，切分阶段从文档记录读取；
@@ -332,11 +352,11 @@ event: error      LLM 调用失败兜底
 - **删除及时释放**：每阶段检查文档是否被删，不留"孤儿"数据；
 - **上限保护**：`MAX_CHUNKS=2000` 防极端大文件打爆内存。
 
-### 9. 长答案治理：不啰嗦、不刷屏
+### 10. 长答案治理：不啰嗦、不刷屏
 - **prompt 约束**：system prompt 明确答案长度——常规问答 ≤200 字，总结/列举类可展开但 ≤600 字，避免模型堆砌客套废话；
 - **前端折叠**：答案超 500 字自动折叠成限高滚动区，点"展开完整回答"再看全文；流式生成过程中始终展开，保证输出过程可见、自动滚动正常。
 
-### 10. 会话过期清理：定时 + 惰性双保险
+### 11. 会话过期清理：定时 + 惰性双保险
 会话数据按**最后活跃时间**治理——超过保留期（`CHAT_RETENTION_DAYS`，默认 30 天）的会话物理删除，`chat_messages` 由外键 `ON DELETE CASCADE` 级联清理，不残留孤儿消息。三层保障：
 
 - **定时 sweep**：`SessionCleaner` 后台 asyncio 循环（lifespan 启停，默认每小时），分批 `DELETE ... ORDER BY id LIMIT 500` + 批间让步，避免大事务拖垮 MySQL；
@@ -439,11 +459,7 @@ good-question/
 └── data/                     # 上传文件存储（uploads/）
 ```
 
-**后端代码分层**（按"是否有业务语义"切四层，依赖单向——下层绝不依赖上层；分层图与依赖规则详见[第二章](#二系统架构)）：
-- **交互层** `api/` + `schemas/`：路由、鉴权、请求解析、响应格式化（薄）；
-- **控制层** `services/chat_service.py`：意图理解、会话状态、任务编排、SSE 事件流组装；
-- **能力层** `services/{document,library,auth,dashboard,retrieval}_service.py`：有业务语义的操作（文档生命周期、知识库管理、检索编排）；
-- **资源层** `services/{llm,embedding,rerank,vector_store,llama_store,chat_cache,chat_cleanup,retrieval_types}` + `models/` + `utils/`：无业务语义的基础设施（LLM/向量库/缓存/ORM/工具）。
+**后端代码分层**：按"是否有业务语义"切四层、依赖单向——下层绝不依赖上层；各层职责、模块归属与依赖规则见[第二章](#二系统架构)。
 
 新增功能一般改 `api/` + 对应 service；新增服务须归层并保持依赖方向（`tests/test_architecture.py` 自动守护，违反即测试失败）。
 
@@ -472,7 +488,7 @@ cd backend && pip install -r requirements.txt -r requirements-dev.txt
 python -m pytest tests/ -v
 ```
 
-**契约验证 / 迁移验证**（需服务已启动，对 `http://localhost`）：
+**契约验证 / 迁移验证**（需服务已启动，对 `http://localhost:8089`）：
 
 ```bash
 python verify_contract.py           # 契约事件流验证
@@ -488,7 +504,7 @@ python test-data/verify_old_data.py # 旧数据迁移后检索链路验证
 ### 环境
 
 ```bash
-docker compose up -d                # 起中间件（mysql/milvus 等）
+docker compose up -d                # 起应用容器（backend/nginx）；中间件由共享 infra 提供
 cd backend && pip install -r requirements.txt -r requirements-dev.txt
 uvicorn main:app --reload --port 8080   # 宿主机热重载 API（不依赖 Docker 内 backend）
 ```
@@ -510,15 +526,12 @@ cd .. && docker compose build nginx && docker compose up -d nginx
 
 ### 跑测试 / 验收
 
-```bash
-docker exec -it rag-backend bash && cd /app && pytest tests/ -v   # 容器内单测
-python verify_contract.py                                          # 宿主机契约验证
-```
+容器内单测、宿主机契约验证与端到端脚本见[第九章](#九测试与验收)。
 
 ### 新增 API
 
 - models → schemas → services → `api/` 路由 → 注册到 `main.py` → 补单元测试；
-- **契约优先**：对外接口先出方案，确认后再实现（本项目架构约束）；LLM 相关接口如需评测平台发现，同步登记进 `api/contracts.py` 的 MANIFEST。
+- **契约优先**：对外接口是契约，改动前先定方案再实现；LLM 相关接口如需评测平台发现，同步登记进 `api/contracts.py` 的 MANIFEST。
 
 ### 数据库变更
 
@@ -527,7 +540,7 @@ python verify_contract.py                                          # 宿主机�
 
 ### 编码规范（约定）
 
-- 4 空格缩进、阿里 Java 规范思想；注释写"为什么"；中文注释、英文标识符；
+- 4 空格缩进；注释写"为什么"；中文注释、英文标识符；
 - 新增接口/消费者打印入参出参（debug 级）；核心逻辑（Service 业务分支）必须单测覆盖；
 - **pre-commit 校验**：提交新特性缺核心单测会被 test-coverage hook 拦截，写代码就配套测试。
 

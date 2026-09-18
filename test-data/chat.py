@@ -3,7 +3,7 @@
 import json, os, sys, urllib.request
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")  # 统一 UTF-8，避免 Windows 控制台 GBK 乱码
 
-BASE = "http://localhost"
+BASE = "http://localhost:8089"
 
 # 登录凭据从环境变量读取（本地开发默认 admin/123456），避免脚本内硬编码
 USER = os.environ.get("RAG_ADMIN_USER", "admin")

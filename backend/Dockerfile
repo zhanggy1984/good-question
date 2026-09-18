@@ -1,3 +1,4 @@
+# syntax=docker/dockerfile:1.4
 FROM python:3.11-slim
 WORKDIR /app
 
@@ -26,6 +27,15 @@ RUN pip install --no-cache-dir -r requirements.txt \
 # 测试依赖（pytest）：体积相对 torch/MinerU 可忽略，装进镜像使
 # docker exec rag-backend pytest 开箱即用，不再需要每次临时 pip install
 RUN pip install --no-cache-dir -r requirements-dev.txt \
+    -i https://mirrors.aliyun.com/pypi/simple \
+    --timeout 180 --retries 15
+
+# obs-sdk 观测 SDK（§11.3 接入）：源码经 compose additional_contexts 独立 context 注入
+# （docker-compose.yml build.additional_contexts.obs-sdk → 本 COPY 的 --from=obs-sdk）。
+# 装拷贝副本而非 -e editable（镜像内无仓外路径）；kafka-python 由 sdk pyproject 声明自动解析。
+# 观测边带在 .env 关闭时（OBS_ENABLED=false）代码路径不触碰本包，此层仍装以保证可回切。
+COPY --from=obs-sdk / /obs-sdk-src
+RUN pip install --no-cache-dir /obs-sdk-src \
     -i https://mirrors.aliyun.com/pypi/simple \
     --timeout 180 --retries 15
 

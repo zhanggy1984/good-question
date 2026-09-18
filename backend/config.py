@@ -94,6 +94,17 @@ class Settings(BaseSettings):
     # MinerU：留空用本地，填入 Token 走官方 API
     mineru_api_token: str = ""
 
+    # ── 观测上报 obs_sdk（§11.3 gq 接入；观测边带，缺省关闭 = 业务零侵入）──
+    # obs_enabled + kafka 连接齐备才 init；topic 完整形如 dev.obs.agent.good-question
+    # （{env}.obs.agent.{name}）。AGENT_VERSION 由进程环境变量注入（obs_sdk init 内读取）。
+    obs_enabled: bool = False
+    obs_kafka_servers: str = ""
+    obs_kafka_topic: str = ""
+    obs_kafka_sasl_username: str = ""   # 生产 SASL；留空 = PLAINTEXT（dev）
+    obs_kafka_sasl_password: str = ""
+    obs_flush_batch: int = 500
+    obs_flush_interval_s: float = 2.0
+
     @property
     def database_url(self) -> str:
         """构建 SQLAlchemy 连接字符串"""

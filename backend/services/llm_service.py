@@ -13,6 +13,7 @@ import httpx
 from langchain_openai import ChatOpenAI
 
 from config import settings
+from utils.trace import mark_llm_hard_fail, unmark_llm_hard_fail
 
 logger = logging.getLogger("native_rag")
 
@@ -195,7 +196,80 @@ def _tool_call_event(tool_acc: dict) -> dict:
 
 
 def stream_chat(messages: list[dict], tools: list[dict] | None = None):
-    """直连 DeepSeek 流式调用，解析 reasoning_content / content / tool_calls / usage
+    """直连 DeepSeek 流式调用（观测旁路包装，§11.3 gq llm_call 覆盖）。
+
+    对底层每条真实 HTTP 流（_stream_chat_http）产出 1 条 llm_call：**流穷尽**与**中途被弃用**
+    两条出口都记 ok（后者 usage 可能为空，见下）；裸异常**先记 error 再抛**（§2.4 前提）。chat_service
+    层 stream_round1_with_retry 的每次重试都是完整付费调用 → 各记 1 条（失败尝试不掩盖）。
+    观测边带：obs_sdk 未安装/未 init（_obs_sdk() 返 None）时零开销直通，调用语义与原先完全一致。
+    """
+    obs = _obs_sdk()
+    if obs is None:
+        yield from _stream_chat_http(messages, tools=tools)
+        return
+    started = time.time()
+    usage: dict = {}
+    # 已记账标志：异常分支必须置位，否则 finally 会把同一次调用再记一条 ok（一次调用两条账）
+    recorded = False
+    try:
+        for ev in _stream_chat_http(messages, tools=tools):
+            if ev.get("type") == "usage":
+                usage = ev["usage"] or {}
+            yield ev
+    except Exception as exc:
+        recorded = True
+        # 请求级硬失败标记：本条流最终失败 ⇒ 用户本轮拿到的是 error 帧兜底话术，root 必须记
+        # error。放在 record_llm **之前**——即便记账本身抛异常，标记也已置位。
+        mark_llm_hard_fail(llm_error_type(exc))
+        obs.record_llm(
+            settings.deepseek_model, "error",
+            duration_ms=int((time.time() - started) * 1000),
+            error_type=llm_error_type(exc), error_msg=str(exc),
+        )
+        raise
+    finally:
+        # ok 收口**必须在 finally**：客户端断连时 chat.py 层 gen.close() 抛 GeneratorExit 在
+        # 上面的 yield 点，它承 BaseException、except Exception 接不住 ⇒ 写在 try 之后的收口
+        # 会静默全丢，而中途弃用恰是真实断连下**唯一**会走的出口（真机对照：截断驱动零
+        # llm_call，完整 drain 才有）。usage 为空仅出现在断连早于流末 usage chunk 时——
+        # 此时调用本身已成功（HTTP 200 且已产出增量），按 ok 记；§13.0 #3「无黑洞」。
+        if not recorded:
+            obs.record_llm(
+                settings.deepseek_model, "ok",
+                duration_ms=int((time.time() - started) * 1000),
+                usage=usage or None,
+            )
+
+
+def _obs_sdk():
+    """惰性取已 init 的 obs_sdk：未安装 / 未 init 返回 None（观测边带不阻塞业务、测试免装依赖）。"""
+    try:
+        import obs_sdk
+    except ImportError:
+        return None
+    return obs_sdk if obs_sdk.is_initialized() else None
+
+
+def llm_error_type(exc: Exception) -> str:
+    """异常 → llm_call error_type。
+
+    值域是平台错误分类白名单（七词），**不是自由字符串**：平台按白名单分层聚类，
+    非白名单值不产生回流候选。原始 HTTP 状态码由 error_msg 保留，故此处不透出码值。
+    三仓（cs/sp/contract-check）须保持同一口径。
+    """
+    if isinstance(exc, httpx.HTTPStatusError):
+        resp = getattr(exc, "response", None)
+        # 仅 429 单列（对应白名单 llm_rate_limit），其余码位无对应词、统一归 llm_other
+        return "llm_rate_limit" if resp is not None and resp.status_code == 429 else "llm_other"
+    if isinstance(exc, httpx.TimeoutException):
+        return "llm_timeout"
+    if isinstance(exc, httpx.TransportError):
+        return "llm_connection"
+    return "llm_other"
+
+
+def _stream_chat_http(messages: list[dict], tools: list[dict] | None = None):
+    """直连 DeepSeek 流式调用（真实 HTTP 层），解析 reasoning_content / content / tool_calls / usage
 
     yield {"type": "reasoning"|"content"|"tool_call"|"usage", ...}
     - reasoning/content：增量文本
@@ -355,4 +429,7 @@ def stream_round1_with_retry(messages: list[dict], tools: list[dict] | None = No
                 "[llm] LLM 首轮瞬时错误，退避后重试（第 %s/%s 次）: %s",
                 attempt, max_attempts, e,
             )
+            # 撤销硬失败标记：走到这里 = 确定还会再调一次，若重试成功用户拿到完整回答，root
+            # 必须记 ok。不撤销 ⇒「首次 429 → 重试成功」被误标 error（假红）。
+            unmark_llm_hard_fail()
             time.sleep(settings.chat_llm_retry_backoff_seconds)

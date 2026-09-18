@@ -21,16 +21,19 @@ class ChatRequest(BaseModel):
     content: str = Field(min_length=1, max_length=4000, description="用户问题")
 
 
-async def _stream_with_disconnect_check(gen, is_disconnected):
+async def _stream_with_disconnect_check(gen, request: Request):
     """迭代 stream_chat 生成器，客户端断开时停止生成
 
     yield (event_type, data)；is_disconnected 为可 await 的断连判断（request.is_disconnected）。
     断连后 return + gen.close()：触发 stream_chat 的 finally（db.close / httpx 流关闭），
     终止对 DeepSeek 的调用，不再烧 token 与连接资源。正常迭代结束 close 是 no-op。
+    断连经 request.state 标记 → obs request 中间件读它记 error+CLIENT_DISCONNECT
+    （观测 request 未完整交付；HTTP 层 200 不足以表达）。
     """
     try:
         for event, data in gen:
-            if await is_disconnected():
+            if await request.is_disconnected():
+                request.state.obs_aborted = True
                 return
             yield event, data
     finally:
@@ -46,6 +49,9 @@ def chat(
     current_user: User = Depends(get_current_user),
 ):
     """发送消息，SSE 流式返回（sources → token* → done）"""
+    # 观测入参（同 obs_aborted 惯例：业务置位 → 观测中间件出口读出）。**在校验之前置位**：
+    # 校验失败（403/404）也是一条要归因的 trace，同样需要现场，否则建不出簇。
+    request.state.obs_input = body.model_dump()
     # 用请求 db 校验会话归属（会话隔离）
     chat_service._get_owned_session(db, session_id, current_user.id)
     logger.debug("[chat] 入参 session_id=%s content=%.50s", session_id, body.content)
@@ -53,7 +59,7 @@ def chat(
     async def event_stream():
         # stream_chat 内部使用独立 db session；客户端断开即停止生成（断连检测）
         gen = chat_service.stream_chat(session_id, body.content)
-        async for event, data in _stream_with_disconnect_check(gen, request.is_disconnected):
+        async for event, data in _stream_with_disconnect_check(gen, request):
             yield f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
 
     return StreamingResponse(

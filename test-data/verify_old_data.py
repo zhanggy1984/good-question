@@ -3,7 +3,7 @@
 import json, os, re, sys, urllib.request
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
-BASE = "http://localhost"
+BASE = "http://localhost:8089"
 
 # 登录凭据从环境变量读取（本地开发默认 admin/admin123），避免脚本内硬编码
 USER = os.environ.get("RAG_ADMIN_USER", "admin")
