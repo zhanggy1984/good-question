@@ -6,7 +6,7 @@ CASCADE 级联清理，Milvus 库 partition 一并删除），保证客观可复
 
 示例文档用 .md（抽取走明文读取，无需 MinerU），只需 MySQL + Milvus + backend 容器。
 
-运行（需服务已启动，对 http://localhost）：
+运行（需服务已启动，对 http://localhost:8089）：
     python test-data/seed_example.py
 
 凭据从环境变量读取（默认 admin/admin123），避免脚本内硬编码：
@@ -21,7 +21,7 @@ import uuid
 
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")  # 统一 UTF-8，避免 Windows 控制台 GBK 乱码
 
-BASE = "http://localhost"
+BASE = "http://localhost:8089"
 LIB_NAME = "示例知识库"
 
 # 示例文档：与 README"八、示例场景"一一对应，文件名即上传后的文档名
@@ -167,7 +167,7 @@ def wait_ready(auth, doc_ids):
 def print_scenarios():
     """打印示例场景问题清单（复制到前端聊天页提问）"""
     print("\n" + "=" * 68)
-    print("示例就绪。请在浏览器打开 http://localhost，以 admin 登录，")
+    print("示例就绪。请在浏览器打开 http://localhost:8089，以 admin 登录，")
     print("进入“聊天问答”选择文档库【示例知识库】，新建会话后复制以下问题提问：")
     print("=" * 68)
     for title, question, expect in SCENARIOS:

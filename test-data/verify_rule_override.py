@@ -12,7 +12,7 @@ LLM 是否检索不可控，但豁免类问题的结果应与 LLM 行为无关�
 import json, os, sys, urllib.request
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
-BASE = "http://localhost"
+BASE = "http://localhost:8089"
 USER = os.environ.get("RAG_ADMIN_USER", "admin")
 PASS = os.environ.get("RAG_ADMIN_PASS", "admin123")
 NOT_FOUND_MARK = "未找到与您问题直接相关的信息"

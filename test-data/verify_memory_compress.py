@@ -15,7 +15,7 @@ import json, os, re, subprocess, sys, urllib.request
 from pathlib import Path
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
-BASE = "http://localhost"
+BASE = "http://localhost:8089"
 USER = os.environ.get("RAG_ADMIN_USER", "admin")
 PASS = os.environ.get("RAG_ADMIN_PASS", "admin123")
 
