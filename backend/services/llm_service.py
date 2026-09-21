@@ -13,7 +13,6 @@ import httpx
 from langchain_openai import ChatOpenAI
 
 from config import settings
-from prompts import load_prompt
 from utils.trace import mark_llm_hard_fail, unmark_llm_hard_fail
 
 logger = logging.getLogger("native_rag")
@@ -32,33 +31,6 @@ def get_llm(streaming: bool = False) -> ChatOpenAI:
         max_retries=2,
         timeout=120,
     )
-
-
-# 正文见 prompts/rewrite_query.md；含 {question} 占位符，调用处 .format(question=...)。
-REWRITE_PROMPT = load_prompt("rewrite_query")
-
-
-# 显式缓存字典（比 lru_cache 可观测：命中/未命中均有日志）
-_rewrite_cache: dict[str, str] = {}
-
-
-def rewrite_query(question: str) -> str:
-    """改写用户问题为利于检索的查询（口语化→规范化、补同义词），失败返回原问题
-
-    显式缓存：相同问题不重复调用 LLM（减少延迟与成本），命中时打日志便于观测。
-    """
-    if question in _rewrite_cache:
-        logger.debug("[llm] query 改写命中缓存: %s", question[:20])
-        return _rewrite_cache[question]
-    try:
-        llm = get_llm(streaming=False)
-        result = llm.invoke(REWRITE_PROMPT.format(question=question)).content.strip()
-        result = result if result else question
-    except Exception as e:
-        logger.warning("[llm] query 改写失败，使用原问题: %s", e)
-        result = question
-    _rewrite_cache[question] = result
-    return result
 
 
 # ═══════════ 流式对话调用（由 chat_service 下沉，资源层职责） ═══════════
