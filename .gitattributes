@@ -1,0 +1,10 @@
+# 提示词模板（backend/prompts/*.md）：不是给人读的文档，而是程序按字节读取、
+# 原样拼进 system 提示词送 LLM 的**程序输入**。
+#
+# 本仓 core.autocrlf=true 且此前无 .gitattributes，故 Windows 上检出会把 LF 转成
+# CRLF，运行时提示词每行多一个 \r——不报错，只是静默改变送给模型的文本。
+# 外置前 .py 里的 "\n" 是转义序列，无论文件什么行尾运行时恒为 LF，不存在这个问题；
+# 这是提示词外置引入的新风险，故显式锁死（对齐 smart-procurement 同款规则）。
+#
+# 只限定到本目录：仓内其他文件维持 git 默认行为，本文件不改变它们的检出结果。
+backend/prompts/*.md text eol=lf
