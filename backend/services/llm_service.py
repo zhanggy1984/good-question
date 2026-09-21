@@ -13,6 +13,7 @@ import httpx
 from langchain_openai import ChatOpenAI
 
 from config import settings
+from prompts import load_prompt
 from utils.trace import mark_llm_hard_fail, unmark_llm_hard_fail
 
 logger = logging.getLogger("native_rag")
@@ -33,16 +34,8 @@ def get_llm(streaming: bool = False) -> ChatOpenAI:
     )
 
 
-REWRITE_PROMPT = """你是文档检索辅助助手。将用户的问题改写为更利于文档检索的查询语句。
-
-要求：
-1. 保持原问题的完整语义，不要只提取关键词堆砌
-2. 补充同义词和相关概念
-3. 口语化表述改为书面语
-4. 输出一句完整、自然的检索查询（不超过 40 字），不要解释
-
-用户问题：{question}
-检索查询："""
+# 正文见 prompts/rewrite_query.md；含 {question} 占位符，调用处 .format(question=...)。
+REWRITE_PROMPT = load_prompt("rewrite_query")
 
 
 # 显式缓存字典（比 lru_cache 可观测：命中/未命中均有日志）
