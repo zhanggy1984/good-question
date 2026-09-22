@@ -365,6 +365,14 @@ event: error      LLM 调用失败兜底
 
 配套 `idx_updated_at` 索引迁移（0004）；`CHAT_CLEANUP_ENABLED=false` 一键停用（硬删除不可逆，保留期勿设过小）。
 
+### 12. 提示词外置：system prompt 与工具描述搬出代码
+system prompt 与检索工具的中文描述原本是 `.py` 里的字符串字面量——改一个措辞要和业务逻辑混在同一个 diff 里评审。现挪到 `backend/prompts/` 的 4 个 `.md`：`chat_system.md`（五段式 XML system prompt）与 `override_context.md`（F3 否决后的第二轮引导语）带 `{summary}` / `{context}` 占位符，由调用方 `.format()` 填充；`retrieve_tool_description.md` 与 `retrieve_query_description.md` 是检索工具 schema 的中文文案，原样使用。
+
+- **加载器只读不解释**：`prompts/__init__.py` 只暴露一个 `load_prompt(name)`——`read_text(encoding="utf-8")` 原样返回，**不做任何插值**。插值时机与参数留给调用方（`SYSTEM_PROMPT.format(summary=...)` 在控制层、`_OVERRIDE_CONTEXT_PROMPT.format(context=...)` 在否决分支），加载器不揣测各调用方的上下文。
+- **边界按"是不是导入期静态常量"切**：外置的是模块导入即确定的文案；随会话运行时拼装的文本仍留在代码里——记忆压缩 prompt 用 f-string 拼对话原文，`_NOT_FOUND_ANSWER` / `_UNKNOWN_ANSWER` 这类固定话术属于回答逻辑而非可独立评审的文案。搬迁提交前后逐字符相同（只搬文本、不改取值），随后又删掉无调用方的 `rewrite_query.md` 模板与配套死代码——没有调用方的模板不留。
+- **外置带来的新变量是行尾**：模板不是给人读的文档，而是程序读取、拼进 system 提示词送 LLM 的**程序输入**，所以它的**文件字节**值得钉住。本仓 `core.autocrlf=true`，此前无 `.gitattributes`，Windows 检出会把 LF 换成 CRLF。但要如实说清：**这并不改变送给模型的文本**——loader 走 `read_text(encoding="utf-8")`，文本模式默认 `newline=None` 会做换行归一化，CRLF 被吃掉（实测本仓 `chat_system.md` 读出来不含 `\r`）。所以锁 LF 不是修某个已知缺陷，它钉住的是两件别的事：一是「字节即基准」这个不变量——谁把 `read_text` 换成 `read_bytes().decode()`，CRLF 才会漏过去，且不报错；二是让按字节核对的验收结论跨平台可复现。故 `.gitattributes` 显式锁定 `backend/prompts/*.md text eol=lf`，且只限定到该目录，仓内其他文件的检出结果不变。
+- **没坏怎么证明**：模板纳入 Git 版本控制，文案改动可 diff、可按提交回滚（回滚 = 切回旧提交后**重新构建并发布**，模板随 Dockerfile `COPY . .` 打进镜像，不是热回滚）；既有单测对 system prompt 的断言（段标签齐备、`{summary}` 在位、答案长度约束、否决语 `<document>` 定界）读的正是 `SYSTEM_PROMPT` / `_OVERRIDE_CONTEXT_PROMPT` 两个常量——外置后它们直接取自文件正文，防注入与长度治理的结构守卫对文件内容同样生效。
+
 ---
 
 ## 六、技术栈一览
@@ -435,6 +443,7 @@ good-question/
 │   │                         #          retrieval_types(接缝数据类) / vector_store(门面)
 │   │                         #          dashboard / library / auth / embedding / llm
 │   ├── scripts/              # migrate_to_milvus.py：从 MySQL chunks 幂等重灌 Milvus
+│   ├── prompts/              # 提示词模板（*.md，外置文案；load_prompt 只读取不插值）
 │   ├── models/               # SQLAlchemy ORM（6 张表）
 │   ├── schemas/              # Pydantic 请求/响应
 │   ├── middleware/           # JWT 鉴权 Depends

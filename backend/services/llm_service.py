@@ -33,41 +33,6 @@ def get_llm(streaming: bool = False) -> ChatOpenAI:
     )
 
 
-REWRITE_PROMPT = """你是文档检索辅助助手。将用户的问题改写为更利于文档检索的查询语句。
-
-要求：
-1. 保持原问题的完整语义，不要只提取关键词堆砌
-2. 补充同义词和相关概念
-3. 口语化表述改为书面语
-4. 输出一句完整、自然的检索查询（不超过 40 字），不要解释
-
-用户问题：{question}
-检索查询："""
-
-
-# 显式缓存字典（比 lru_cache 可观测：命中/未命中均有日志）
-_rewrite_cache: dict[str, str] = {}
-
-
-def rewrite_query(question: str) -> str:
-    """改写用户问题为利于检索的查询（口语化→规范化、补同义词），失败返回原问题
-
-    显式缓存：相同问题不重复调用 LLM（减少延迟与成本），命中时打日志便于观测。
-    """
-    if question in _rewrite_cache:
-        logger.debug("[llm] query 改写命中缓存: %s", question[:20])
-        return _rewrite_cache[question]
-    try:
-        llm = get_llm(streaming=False)
-        result = llm.invoke(REWRITE_PROMPT.format(question=question)).content.strip()
-        result = result if result else question
-    except Exception as e:
-        logger.warning("[llm] query 改写失败，使用原问题: %s", e)
-        result = question
-    _rewrite_cache[question] = result
-    return result
-
-
 # ═══════════ 流式对话调用（由 chat_service 下沉，资源层职责） ═══════════
 
 

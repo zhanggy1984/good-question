@@ -57,7 +57,8 @@ class HybridRetriever:
         # 0. 直接用原 query 检索，不再 LLM 改写：
         #    改写需每次检索前多一次 LLM 调用（2-4s），是 sources 事件前的主要延迟；
         #    且历史实测改写检索结果与原 query 几乎一致（双路 vs 单路结论），收益趋零。
-        #    未来若需规范化改写，可重新启用 llm_service.rewrite_query。
+        #    故改写实现（含其 prompt 模板）已于 2026-09 作为死代码删除；若将来要恢复，
+        #    从 git 历史取回，勿只凭本注释重写。
         search_query = query
 
         # 1. Milvus 混合检索：dense + 稀疏双路召回 + RRF 融合（服务端完成）
